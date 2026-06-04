@@ -24,18 +24,41 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS for frontend dev server and Azure deployment
+# ---------------------------------------------------------------------------
+# CORS — origins are loaded from the ALLOWED_ORIGINS environment variable.
+# Set ALLOWED_ORIGINS to a comma-separated list of trusted domains, e.g.:
+#   ALLOWED_ORIGINS=https://shipmate.example.com,https://staging.shipmate.example.com
+# Defaults to localhost dev servers when the variable is not set.
+# allow_credentials is only enabled when the origin list is explicitly
+# restricted (i.e. does not contain a wildcard).
+# ---------------------------------------------------------------------------
+_raw_origins = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://localhost:3000,"
+    "http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:3000",
+)
+allowed_origins = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
+
+# Never allow credentials alongside a wildcard origin.
+_has_wildcard = "*" in allowed_origins
+if _has_wildcard:
+    # Safety net: if someone accidentally sets ALLOWED_ORIGINS=*, strip the
+    # wildcard and fall back to an empty list so the server starts safely
+    # rather than silently exposing credentialed endpoints to every origin.
+    import warnings
+    warnings.warn(
+        "ALLOWED_ORIGINS contains a wildcard '*'. "
+        "Wildcard origins are not permitted with credentialed requests. "
+        "Falling back to no allowed origins — set ALLOWED_ORIGINS to an "
+        "explicit list of trusted domains.",
+        stacklevel=1,
+    )
+    allowed_origins = []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=True,  # safe: wildcard is rejected above
     allow_methods=["*"],
     allow_headers=["*"],
 )
