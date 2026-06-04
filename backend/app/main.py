@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -8,6 +10,25 @@ import uvicorn
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.analysis import router as analysis_router
+
+# ---------------------------------------------------------------------------
+# CORS origin allowlist
+# In production set ALLOWED_ORIGINS to a comma-separated list of origins, e.g.:
+#   ALLOWED_ORIGINS=https://app.shipmate.ai
+# Defaults to localhost dev origins when the variable is absent.
+# ---------------------------------------------------------------------------
+_raw_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://localhost:3000,http://127.0.0.1:5173",
+)
+ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# Guard: credentials + wildcard is both insecure and rejected by Starlette.
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS must not contain '*'. "
+        "Provide an explicit list of trusted origins."
+    )
 
 app = FastAPI(
     title="ShipMate AI",
@@ -19,12 +40,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,7 +72,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
+  <title>ShipMate AI \u2013 GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -75,7 +91,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
+    <h1>Completing GitHub authorization\u2026</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
