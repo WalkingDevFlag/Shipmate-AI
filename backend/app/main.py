@@ -6,7 +6,7 @@ import re
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
 from app.api.routes.auth import router as auth_router
@@ -23,7 +23,7 @@ from app.db.database import init_db
 # ---------------------------------------------------------------------------
 _raw_origins = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://localhost:3000,http://127.0.0.1:5173",
+    "https://localhost:5173,https://localhost:5174,https://localhost:3000,https://127.0.0.1:5173",
 )
 ALLOWED_ORIGINS: list[str] = [
     origin.strip() for origin in _raw_origins.split(",") if origin.strip()
@@ -64,6 +64,23 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ---------------------------------------------------------------------------
+# HTTPS enforcement middleware
+# In production (ENFORCE_HTTPS=true) any plain HTTP request is redirected
+# to its HTTPS equivalent with a 301 permanent redirect.
+# Disabled by default so local development without TLS is unaffected.
+# ---------------------------------------------------------------------------
+_ENFORCE_HTTPS = os.getenv("ENFORCE_HTTPS", "false").lower() == "true"
+
+
+@app.middleware("http")
+async def https_redirect_middleware(request: Request, call_next):
+    if _ENFORCE_HTTPS and request.url.scheme == "http":
+        https_url = request.url.replace(scheme="https")
+        return RedirectResponse(url=str(https_url), status_code=301)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +169,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
+  <title>ShipMate AI \u2013 GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -171,7 +188,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
+    <h1>Completing GitHub authorization\u2026</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
