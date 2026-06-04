@@ -1,0 +1,44 @@
+name: Enforce HTTPS URLs
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  check-http-urls:
+    name: Reject plain http:// URLs in source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan for plain http:// URLs
+        run: |
+          # Search TypeScript, JavaScript, and Python source files for plain
+          # http:// URLs, excluding:
+          #   - localhost and 127.0.0.1 (acceptable for local dev defaults)
+          #   - lines that are pure comments (# or //)
+          #   - http://schemas.* / http://www.w3.org (XML namespace URIs)
+          #   - http://json-schema.org (JSON Schema meta URIs)
+          FOUND=$(grep -rn --include='*.ts' --include='*.tsx' \
+                            --include='*.js' --include='*.jsx' \
+                            --include='*.py' \
+                  'http://' \
+                  frontend/src backend/app \
+            | grep -v 'localhost' \
+            | grep -v '127\.0\.0\.1' \
+            | grep -Ev '^[^:]+:[0-9]+:[[:space:]]*(#|//)' \
+            | grep -Ev 'http://(schemas\.|www\.w3\.org|json-schema\.org)' \
+            || true)
+
+          if [ -n "$FOUND" ]; then
+            echo "ERROR: Plain http:// URLs found in source files:"
+            echo "$FOUND"
+            echo ""
+            echo "Replace all http:// URLs with https:// equivalents."
+            exit 1
+          fi
+
+          echo "No plain http:// URLs found. \u2713"
