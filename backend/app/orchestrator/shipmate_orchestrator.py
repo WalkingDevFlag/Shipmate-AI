@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, AsyncGenerator
 
 from ..agents.repo_lens_agent import RepoLensAgent
 from ..agents.plan_forge_agent import PlanForgeAgent
@@ -29,8 +29,10 @@ class ShipMateOrchestrator:
         self.guardrail = GuardRailAgent()
         self.testpilot = TestPilotAgent()
 
-    def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
+    async def run(self, repo_context: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
         """
+        Async generator that yields each agent's result incrementally.
+
         Args:
             repo_context: dict with keys:
                 - repo_info: dict (from GitHub API)
@@ -39,20 +41,50 @@ class ShipMateOrchestrator:
                 - branch: str
                 - feature_context: str (optional)
                 - pr_info: dict (optional)
-        Returns:
-            ShipMateReport
+
+        Yields:
+            Dict with keys:
+                - agent: str (agent name)
+                - output: agent result dict
         """
         # ── Step 1: RepoLens (must run first — other agents need its output) ──
         repo_lens_out = self.repo_lens.run(repo_context)
+        yield {"agent": "repo_lens", "output": repo_lens_out}
 
         # Enrich context with RepoLens output
         enriched = {**repo_context, "repo_lens": repo_lens_out}
 
         # ── Step 2: Run remaining agents (all consume enriched context) ──
         plan_forge_out = self.plan_forge.run(enriched)
-        guardrail_out = self.guardrail.run(enriched)
-        testpilot_out = self.testpilot.run(enriched)
+        yield {"agent": "plan_forge", "output": plan_forge_out}
 
+        guardrail_out = self.guardrail.run(enriched)
+        yield {"agent": "guardrail", "output": guardrail_out}
+
+        testpilot_out = self.testpilot.run(enriched)
+        yield {"agent": "testpilot", "output": testpilot_out}
+
+    def assemble_report(
+        self,
+        repo_context: Dict[str, Any],
+        repo_lens_out: Any,
+        plan_forge_out: Any,
+        guardrail_out: Any,
+        testpilot_out: Any,
+    ) -> ShipMateReport:
+        """
+        Assembles the final ShipMateReport from all agent outputs.
+
+        Args:
+            repo_context: original repo context dict
+            repo_lens_out: RepoLens agent output
+            plan_forge_out: PlanForge agent output
+            guardrail_out: GuardRail agent output
+            testpilot_out: TestPilot agent output
+
+        Returns:
+            ShipMateReport
+        """
         # ── Step 3: Score ──
         score_breakdown = ScoringService.calculate(
             repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
