@@ -1,9 +1,11 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from app.schemas.api_schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
 
 import httpx
+import json
 
 router = APIRouter(tags=["analysis"])
 
@@ -79,7 +81,21 @@ async def _verify_repo_write_access(token: str, owner: str, repo: str) -> None:
         )
 
 
-@router.post("/analyze", response_model=AnalyzeResponse)
+async def _stream_analysis(repo_context):
+    """
+    Async generator that yields SSE-formatted frames for each agent result.
+    
+    Yields agent results as they complete, then sends a final [DONE] sentinel.
+    """
+    async for agent_result in _orchestrator.run(repo_context):
+        frame = f"data: {json.dumps(agent_result)}\n\n"
+        yield frame
+    
+    # Send final sentinel
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/analyze")
 async def analyze(request: AnalyzeRequest):
     """
     Run the ShipMate 4-agent analysis pipeline on a GitHub repository.
@@ -92,7 +108,7 @@ async def analyze(request: AnalyzeRequest):
       5. GuardRail → security findings, secrets, CORS, auth
       6. TestPilot → coverage gaps, suggested tests
       7. Score → weighted readiness score (0-100)
-      8. Return ShipMateReport
+      8. Stream results as SSE frames
     """
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
@@ -119,9 +135,11 @@ async def analyze(request: AnalyzeRequest):
             detail=f"Failed to fetch repository data from GitHub: {str(e)}"
         )
 
-    try:
-        report = _orchestrator.run(repo_context)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
-
-    return AnalyzeResponse(status="complete", report=report)
+    return StreamingResponse(
+        _stream_analysis(repo_context),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
