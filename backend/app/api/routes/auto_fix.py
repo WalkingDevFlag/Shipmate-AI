@@ -57,6 +57,15 @@ class AutoFixRequest(BaseModel):
     access_token: str
     rounds: int = _DEFAULT_ROUNDS
     open_pr: bool = True
+    # The bulk "Auto-fix" button is the do-everything path, so multi-file
+    # features (milestones/blockers) should be DECOMPOSED into ordered steps
+    # rather than silently skipped when one Coder call returns 0 files. The
+    # decomposer fetches step-path originals so steps edit (not blind-rewrite)
+    # and the scope guard still sees the originals. Off → identical to the
+    # per-finding Apply-Fix button. diff_mode stays off (full-file is the
+    # safer default; diff mode auto-falls back anyway).
+    decompose: bool = True
+    diff_mode: bool = False
 
 
 def _sse(obj: Dict[str, Any]) -> str:
@@ -135,9 +144,13 @@ async def _run_loop(req: AutoFixRequest) -> AsyncIterator[str]:
             })
             yield _sse({"event": "actuate.start", "kind": f.kind, "title": f.title})
 
+            # Decompose only multi-file kinds; a guardrail/test tweak is
+            # single-file by nature and planning would just add latency.
+            _decompose = req.decompose and f.kind in ("milestone", "blocker")
             actuate_req = ActuateRequest(
                 owner=req.owner, repo=req.repo, branch=req.branch,
                 access_token=req.access_token, finding=f, open_pr=req.open_pr,
+                decompose=_decompose, diff_mode=req.diff_mode,
             )
             try:
                 resp = await CoderOrchestrator.run_actuation(actuate_req)

@@ -133,13 +133,21 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-timeout
 
       - name: pytest (+coverage +JUnit XML)
+        # Hard caps so a single hung test can NEVER wedge the whole job (which
+        # was leaving the run in_progress for 30+ min and blocking the CI
+        # watcher). --timeout kills any test exceeding 60s and dumps its stack
+        # (faulthandler) so the culprit is visible in the log; the job-level
+        # timeout-minutes is a belt-and-suspenders backstop. The suite runs in
+        # ~1.5s locally, so 60s/test + 8min/job is enormous headroom.
+        timeout-minutes: 8
         run: |
           mkdir -p reports
           PYTHONPATH=. pytest \
             --tb=short \
+            --timeout=60 --timeout-method=thread \
             --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term \
             --cov-fail-under=${{ env.COV_FAIL_UNDER }} \
             --junitxml=reports/junit.xml \

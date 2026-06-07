@@ -386,12 +386,35 @@ class CIWatcher:
                 return None
 
             polls += 1
-            cls._touch(entry, f"poll[{polls}] runs={len(status.runs)} completed={status.all_completed}")
+            cls._touch(
+                entry,
+                f"poll[{polls}] runs={len(status.runs)} "
+                f"completed={status.all_completed} any_failed={status.any_failed}",
+            )
 
             if status.is_empty and polls >= 6:
                 # 3 minutes of empty checks — repo has no CI at all.
                 return status
             if status.all_completed:
+                return status
+
+            # Act on a KNOWN failure without waiting for slow/stuck siblings.
+            # A single failed check means CI is red regardless of what the
+            # pending jobs do, and the Coder fix + new commit re-triggers the
+            # whole run anyway. Critically, this unblocks the case where one
+            # job is wedged in GitHub's infra (queued/stuck in_progress for
+            # tens of minutes): without this, all_completed never goes true and
+            # the watcher would idle until the 45-min wall clock, never fixing
+            # the failure it can already see. We require a brief settle (a
+            # couple polls) so we don't fire on a transient first-poll blip
+            # before fast checks register.
+            if status.any_failed and polls >= 2:
+                logger.info(
+                    "CIWatcher: %s/%s#%s has a failed check with %d run(s) still "
+                    "pending — acting now rather than waiting for stragglers",
+                    entry.owner, entry.repo, entry.pr_number,
+                    sum(1 for r in status.runs if r.get("status") != "completed"),
+                )
                 return status
 
             # Wall-clock check inside the wait loop too.

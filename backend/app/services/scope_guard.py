@@ -71,7 +71,7 @@ _PROTECTED_FRAGMENTS = (
 # "remov" matches remove/removing/removal, "consolidat" matches
 # consolidate/consolidating, etc.).
 _REMOVAL_INTENT_RE = re.compile(
-    r"\b(remov|delet|drop|deprecat|consolidat|dedup|de-dup|"
+    r"\b(remov|delet|drop|deprecat|consolidat|dedup|de-dup|rewrit|"
     r"merg\w*\s+duplicat|replac\w*\s+(the\s+)?(duplicate|shadow)|"
     r"unus|dead\s+code|clean\s*up|refactor)",
     re.IGNORECASE,
@@ -79,6 +79,14 @@ _REMOVAL_INTENT_RE = re.compile(
 
 # Module-level dunder/throwaway names we don't care about losing.
 _IGNORABLE_NAMES = {"_", "__all__"}
+
+# Mass-deletion heuristic for ANY other text file (README, docs, configs not
+# in the protected list). A patch that removes a large FRACTION *and* a
+# meaningful absolute COUNT of a file's existing lines is almost always drift
+# — e.g. a "add a CI badge" patch that also deleted 626 lines of README.
+# Both thresholds must trip, so small edits and short files never false-fire.
+_MASS_DELETE_FRACTION = 0.40
+_MASS_DELETE_MIN_LINES = 30
 
 
 def _is_protected_nonpy(path: str) -> bool:
@@ -182,6 +190,27 @@ def check_file(
             ]
         return []
 
+    # Catch-all for any other text file (README, docs, etc.): a mass deletion
+    # that nukes a large fraction of the file is drift the .py / protected
+    # checks above won't see. (PR #26 added a CI badge to README and deleted
+    # 626 lines of architecture docs — no gate caught it.)
+    if removal_ok:
+        return []
+    before_lines = _significant_lines(original)
+    after_lines = _significant_lines(new_content)
+    if not before_lines:
+        return []
+    removed = before_lines - after_lines
+    frac = len(removed) / len(before_lines)
+    if len(removed) >= _MASS_DELETE_MIN_LINES and frac >= _MASS_DELETE_FRACTION:
+        return [
+            f"{path}: rewrite DELETES {len(removed)} of {len(before_lines)} "
+            f"existing lines ({frac:.0%} of the file). A change that removes "
+            f"this much content is almost always scope drift (e.g. a small "
+            f"edit that also nuked the rest of the file). If the deletion is "
+            f"intentional, say so in the rationale; otherwise preserve the "
+            f"existing content."
+        ]
     return []
 
 

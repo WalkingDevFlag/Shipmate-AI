@@ -129,10 +129,49 @@ class TestProtectedFileLineDrop:
         assert sg.check_file(".gitignore", original, new,
                              rationale="remove the stale-entry line") == []
 
-    def test_non_protected_file_not_checked(self):
-        """A regular .md / .json file isn't line-diffed."""
+    def test_small_md_edit_not_flagged(self):
+        """A small edit to a short prose file is fine — mass-delete heuristic
+        needs both a high fraction AND a meaningful absolute count."""
         original = "line a\nline b\nline c\n"
         new = "line a\n"
+        assert sg.check_file("README.md", original, new) == []
+
+
+class TestMassDeletion:
+    """Catch-all: a patch that nukes a large fraction of ANY text file
+    (the PR #26 README scenario — added a CI badge, deleted 626 lines)."""
+
+    def test_readme_mass_deletion_flagged(self):
+        # 100-line README; patch keeps 3 lines + adds a badge (deletes 97%).
+        original = "# ShipMate\n" + "".join(f"section line {i}\n" for i in range(100))
+        new = "# ShipMate\n[![CI](badge)](url)\nsection line 0\n"
+        issues = sg.check_file("README.md", original, new,
+                               rationale="add a CI status badge to the README")
+        assert issues, "should flag the mass README deletion"
+        assert "DELETES" in issues[0] and "%" in issues[0]
+
+    def test_mass_deletion_with_intent_relaxed(self):
+        original = "# Docs\n" + "".join(f"old line {i}\n" for i in range(100))
+        new = "# Docs\nrewritten\n"
+        assert sg.check_file("docs/guide.md", original, new,
+                             rationale="rewrite the outdated guide from scratch") == []
+
+    def test_below_absolute_threshold_not_flagged(self):
+        # 50% deletion but only 10 lines removed — below the 30-line floor.
+        original = "".join(f"line {i}\n" for i in range(20))
+        new = "".join(f"line {i}\n" for i in range(10))
+        assert sg.check_file("notes.txt", original, new) == []
+
+    def test_below_fraction_threshold_not_flagged(self):
+        # 35 lines removed but from a 200-line file (17%) — below 40%.
+        original = "".join(f"line {i}\n" for i in range(200))
+        new = "".join(f"line {i}\n" for i in range(165))
+        assert sg.check_file("big.md", original, new) == []
+
+    def test_mass_addition_not_flagged(self):
+        """Adding lots of content (the normal case) is never drift."""
+        original = "".join(f"line {i}\n" for i in range(100))
+        new = original + "".join(f"new {i}\n" for i in range(100))
         assert sg.check_file("README.md", original, new) == []
 
 
