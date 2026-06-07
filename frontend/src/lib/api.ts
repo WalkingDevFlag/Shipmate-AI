@@ -70,6 +70,57 @@ export const api = {
     return data;
   },
 
+  async analyzeStream(
+    params: {
+      owner: string;
+      repo: string;
+      branch: string;
+      access_token: string;
+      pr_number?: number;
+      feature_context?: string;
+    },
+    onEvent: (e: { agent: string; output: any }) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const resp = await fetch(`${BASE}/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal,
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error(`analyze stream failed: HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line.
+      let sep: number;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              const payload = JSON.parse(line.slice(6));
+              // Check for [DONE] sentinel
+              if (payload === '[DONE]') {
+                return;
+              }
+              onEvent(payload);
+            } catch {
+              // ignore malformed frame
+            }
+          }
+        }
+      }
+    }
+  },
+
   // ── Actuate (Coder → branch + PR) ───────────────────────────────────────
 
   async actuate(params: {
