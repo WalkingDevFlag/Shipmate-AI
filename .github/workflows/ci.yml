@@ -145,8 +145,12 @@ jobs:
         timeout-minutes: 8
         run: |
           mkdir -p reports
+          # --timeout kills any test exceeding 60s and dumps its stack so a
+          # single hang can't wedge the whole job (see conftest anyio_backend
+          # fixture for the root cause that made this necessary). -rfE names
+          # any failures/errors in the summary without full verbosity.
           PYTHONPATH=. pytest \
-            --tb=short \
+            --tb=short -rfE \
             --timeout=60 --timeout-method=thread \
             --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term \
             --cov-fail-under=${{ env.COV_FAIL_UNDER }} \
