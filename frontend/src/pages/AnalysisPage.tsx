@@ -1,305 +1,168 @@
 import { useState, useEffect, useRef } from 'react';
-import { motion } from 'framer-motion';
-import { X, Rocket, Check } from 'lucide-react';
-import { AGENTS } from '../lib/agents';
-import { AgentCard } from '../components/ui/AgentCard';
-import { LiveActivityLog } from '../components/ui/LiveActivityLog';
-import { Spinner } from '../components/ui/GitHubConnectButton';
-import { RadarBg } from '../components/ui/RadarBg';
-import type { LogLine } from '../components/ui/LiveActivityLog';
-import type { GitHubRepo, GitHubPR, AgentProgress } from '../types';
-import { api } from '../lib/api';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { streamAnalysis, AgentResult } from '../lib/api';
 
-/* ---------- Pipeline Radar ---------- */
-function PipelineRadar({ statuses }: { statuses: string[] }) {
-  const size = 300, c = size / 2, R = 110;
-  const positions = AGENTS.map((_, i) => {
-    const ang = (-90 + i * 90) * Math.PI / 180;
-    return { x: c + R * Math.cos(ang), y: c + R * Math.sin(ang) };
-  });
+interface LocationState {
+  repoUrl: string;
+  githubToken?: string;
+}
+
+export default function AnalysisPage() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const state = location.state as LocationState | null;
+
+  const [events, setEvents] = useState<AgentResult[]>([]);
+  const [streaming, setStreaming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  const stopRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (!state?.repoUrl) {
+      navigate('/');
+      return;
+    }
+
+    setStreaming(true);
+    setError(null);
+    setDone(false);
+    setEvents([]);
+
+    const stop = streamAnalysis(
+      { repo_url: state.repoUrl, github_token: state.githubToken },
+      (event) => {
+        setEvents((prev) => {
+          const idx = prev.findIndex((e) => e.agent === event.agent);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = event;
+            return next;
+          }
+          return [...prev, event];
+        });
+      },
+      () => {
+        setStreaming(false);
+        setDone(true);
+      },
+      (err) => {
+        setStreaming(false);
+        setError(err.message);
+      }
+    );
+
+    stopRef.current = stop;
+
+    return () => {
+      stopRef.current?.();
+    };
+  }, [state, navigate]);
+
+  const agents = ['RepoLens', 'PlanForge', 'TestPilot', 'GuardRail'];
 
   return (
-    <div style={{ position: 'relative', width: size, height: size, margin: '0 auto' }}>
-      {/* Compass rings */}
-      {[1, 0.66, 0.33].map((f, i) => (
-        <div key={i} className="compass-ring" style={{
-          position: 'absolute',
-          width: R * 2 * f, height: R * 2 * f,
-          top: c - R * f, left: c - R * f,
-          borderColor: 'rgba(96,165,250,0.14)',
-        }} />
-      ))}
+    <div className="min-h-screen bg-gray-950 text-white p-8">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-3xl font-bold">Analysis</h1>
+          <button
+            onClick={() => navigate('/')}
+            className="text-gray-400 hover:text-white transition-colors"
+          >
+            ← Back
+          </button>
+        </div>
 
-      {/* Radar sweep */}
-      <div style={{ position: 'absolute', left: c - R, top: c - R, width: R * 2, height: R * 2 }}>
-        <div className="radar-sweep" style={{ opacity: 0.5 }} />
-      </div>
+        {state?.repoUrl && (
+          <p className="text-gray-400 mb-8 font-mono text-sm">{state.repoUrl}</p>
+        )}
 
-      {/* SVG connector lines */}
-      <svg width={size} height={size} style={{ position: 'absolute', inset: 0 }}>
-        {positions.map((p, i) => {
-          const st = statuses[i];
-          return (
-            <line key={i} x1={c} y1={c} x2={p.x} y2={p.y}
-              stroke={st !== 'pending' ? AGENTS[i].hex : 'rgba(255,255,255,0.08)'}
-              strokeWidth="1.5" strokeDasharray="3 4"
-              style={{ transition: 'stroke .4s', opacity: st === 'complete' ? 0.8 : st === 'running' ? 0.6 : 0.3 }}
-            />
-          );
-        })}
-      </svg>
-
-      {/* Center rocket */}
-      <div style={{
-        position: 'absolute', left: c - 30, top: c - 30, width: 60, height: 60,
-        borderRadius: 16, display: 'grid', placeItems: 'center',
-        background: 'linear-gradient(135deg,#2563eb,#0e7490)',
-        border: '1px solid rgba(255,255,255,0.25)',
-        boxShadow: '0 0 30px rgba(37,99,235,0.6)',
-        animation: 'float 3s ease-in-out infinite',
-      }}>
-        <Rocket size={28} style={{ color: '#fff' }} />
-      </div>
-
-      {/* Agent nodes */}
-      {AGENTS.map((agent, i) => {
-        const p = positions[i];
-        const st = statuses[i];
-        return (
-          <div key={agent.key} style={{
-            position: 'absolute', left: p.x - 27, top: p.y - 27, width: 54, height: 54,
-            borderRadius: 15, display: 'grid', placeItems: 'center',
-            background: st === 'pending' ? 'rgba(255,255,255,0.03)' : `${agent.hex}1f`,
-            border: `1.5px solid ${st === 'pending' ? 'var(--line-2)' : agent.hex}`,
-            color: st === 'pending' ? 'var(--ink-4)' : agent.hex,
-            boxShadow: st === 'running' ? `0 0 22px ${agent.hex}88` : 'none',
-            transition: 'all .4s ease',
-            transform: st === 'running' ? 'scale(1.12)' : 'scale(1)',
-          }}>
-            {st === 'running'  ? <Spinner size={20} dark={false} />
-             : st === 'complete' ? <Check size={22} />
-             : <agent.Icon size={20} />}
+        {error && (
+          <div className="bg-red-900/50 border border-red-500 rounded-lg p-4 mb-6">
+            <p className="text-red-300">{error}</p>
           </div>
-        );
-      })}
+        )}
+
+        <div className="grid gap-4">
+          {agents.map((agentName) => {
+            const result = events.find((e) => e.agent === agentName);
+            return (
+              <AgentCard
+                key={agentName}
+                name={agentName}
+                result={result}
+                streaming={streaming}
+              />
+            );
+          })}
+        </div>
+
+        {done && (
+          <div className="mt-8 text-center text-green-400 font-semibold">
+            ✓ Analysis complete
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-/* ---------- Log lines generator ---------- */
-const LOG_SCRIPT: Omit<LogLine, 'time'>[] = [
-  { agent: 'system',   text: 'Cloning repository @ main…',                           tone: 'slate'   },
-  { agent: 'RepoLens', text: 'scanning dependency graph…',                           tone: 'emerald' },
-  { agent: 'RepoLens', text: 'detected React, TypeScript, Vite configuration',       tone: 'emerald' },
-  { agent: 'RepoLens', text: 'architecture pattern identified: SPA',                 tone: 'emerald' },
-  { agent: 'RepoLens', text: 'dependency scan complete: 1,184 packages',             tone: 'emerald' },
-  { agent: 'GuardRail', text: 'checking exposed secrets & CVEs…',                   tone: 'amber'   },
-  { agent: 'GuardRail', text: '⚠ potential secret found in env.example',            tone: 'red'     },
-  { agent: 'GuardRail', text: 'scanning CORS configuration…',                       tone: 'amber'   },
-  { agent: 'GuardRail', text: 'dependency vulnerability scan complete',              tone: 'amber'   },
-  { agent: 'PlanForge', text: 'analysing commit history & open issues…',            tone: 'purple'  },
-  { agent: 'PlanForge', text: 'generating delivery milestones…',                    tone: 'purple'  },
-  { agent: 'PlanForge', text: 'next best action identified',                        tone: 'purple'  },
-  { agent: 'TestPilot', text: 'discovering test suites…',                           tone: 'cyan'    },
-  { agent: 'TestPilot', text: 'estimating coverage gaps…',                          tone: 'cyan'    },
-  { agent: 'TestPilot', text: 'generating suggested test cases',                    tone: 'cyan'    },
-  { agent: 'system',   text: '✓ Readiness score computed — shipping report',        tone: 'emerald' },
-];
-
-function useActivityLog(running: boolean): LogLine[] {
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const idxRef = useRef(0);
-
-  useEffect(() => {
-    if (!running) {
-      // Reset via a microtask to avoid synchronous setState in effect body
-      const t = setTimeout(() => { setLogs([]); idxRef.current = 0; }, 0);
-      return () => clearTimeout(t);
-    }
-    const tick = () => {
-      const line = LOG_SCRIPT[idxRef.current];
-      if (!line) return;
-      const now = new Date();
-      const hh = String(now.getHours()).padStart(2, '0');
-      const mm = String(now.getMinutes()).padStart(2, '0');
-      const ss = String(now.getSeconds()).padStart(2, '0');
-      setLogs(prev => [...prev, { ...line, time: `${hh}:${mm}:${ss}` }]);
-      idxRef.current++;
-    };
-    tick();
-    // Spread the 16-line script across ~28s of analysis (avg ~1.75s/line) so
-    // the log scroll roughly tracks the real LLM-driven pipeline.
-    const id = setInterval(tick, 1750);
-    return () => clearInterval(id);
-  }, [running]);
-
-  return logs;
+interface AgentCardProps {
+  name: string;
+  result?: AgentResult;
+  streaming: boolean;
 }
 
-/* ---------- Status mapping ---------- */
-const ID_TO_INDEX: Record<string, number> = {
-  repo_lens: 0, plan_forge: 1, guardrail: 2, testpilot: 3,
-};
-const STATUS_MAP: Record<string, string> = {
-  idle: 'pending', running: 'running', complete: 'complete', error: 'error',
-};
+function AgentCard({ name, result, streaming }: AgentCardProps) {
+  const statusColor = !result
+    ? 'border-gray-700'
+    : result.status === 'complete'
+    ? 'border-green-500'
+    : result.status === 'error'
+    ? 'border-red-500'
+    : 'border-yellow-500';
 
-interface Props {
-  selectedRepo: GitHubRepo | null;
-  selectedBranch: string;
-  selectedPull: GitHubPR | null;
-  agents: AgentProgress[];
-  /** 0..100 per agent id — matches the time-driven simulation in App.tsx. */
-  progressByAgent?: Record<AgentProgress['id'], number>;
-  /** 0..100 overall, capped at 95 until API resolves. */
-  overallPct?: number;
-  onCancel: () => void;
-}
-
-export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, onCancel }: Props) {
-  const logs = useActivityLog(true);
-  const [agentStates, setAgentStates] = useState<Record<string, AgentProgress>>({
-    repo_lens: { id: 'repo_lens', status: 'idle' },
-    plan_forge: { id: 'plan_forge', status: 'idle' },
-    guardrail: { id: 'guardrail', status: 'idle' },
-    testpilot: { id: 'testpilot', status: 'idle' },
-  });
-  const [isComplete, setIsComplete] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    // Start consuming the SSE stream when component mounts
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    const consumeStream = async () => {
-      if (!selectedRepo) return;
-
-      try {
-        await api.analyzeStream(
-          {
-            owner: selectedRepo.owner.login,
-            repo: selectedRepo.name,
-            branch: selectedBranch,
-            access_token: '', // Token should be passed from parent or context
-          },
-          (event) => {
-            // Handle agent result event
-            if (event.agent && event.output) {
-              setAgentStates(prev => ({
-                ...prev,
-                [event.agent]: {
-                  id: event.agent,
-                  status: 'complete',
-                },
-              }));
-            }
-          },
-          controller.signal,
-        );
-        // Stream ended successfully
-        setIsComplete(true);
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.error('Stream error:', err);
-        }
-      }
-    };
-
-    consumeStream();
-
-    return () => {
-      controller.abort();
-    };
-  }, [selectedRepo, selectedBranch]);
-
-  const statuses = AGENTS.map((_, i) => {
-    const match = agents.find(a => ID_TO_INDEX[a.id] === i);
-    return match ? (STATUS_MAP[match.status] ?? 'pending') : 'pending';
-  });
-
-  // Use the real elapsed-time-driven overall if available; fall back to the
-  // old completeCount-based calc for safety.
-  const overall = overallPct ?? Math.round(
-    (agents.filter(a => a.status === 'complete').length / agents.length) * 100
-  );
-  const activeAgent = AGENTS.find((_, i) => statuses[i] === 'running');
+  const statusLabel = !result
+    ? streaming
+      ? 'Waiting…'
+      : 'Pending'
+    : result.status === 'complete'
+    ? 'Complete'
+    : result.status === 'error'
+    ? 'Error'
+    : 'Running…';
 
   return (
-    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
-      style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <h1 style={{ fontSize: 25, fontWeight: 840, margin: 0, letterSpacing: '-0.025em', color: '#fff' }}>
-              {overall >= 100 ? 'Analysis Complete' : 'Analysis in Progress'}
-            </h1>
-            {overall < 100 && <span className="chip tone-blue"><Spinner size={11} dark={false} /> running</span>}
-          </div>
-          {selectedRepo && (
-            <p className="mono muted" style={{ fontSize: 13, margin: '6px 0 0' }}>
-              {selectedRepo.owner.login}/{selectedRepo.name} · {selectedBranch}
-            </p>
-          )}
-        </div>
-        <button className="btn btn-danger" onClick={onCancel}>
-          <X size={14} /> Cancel Analysis
-        </button>
+    <div className={`bg-gray-900 border ${statusColor} rounded-lg p-6 transition-colors`}>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-lg font-semibold">{name}</h2>
+        <span
+          className={`text-sm px-2 py-1 rounded ${
+            !result
+              ? 'bg-gray-800 text-gray-400'
+              : result.status === 'complete'
+              ? 'bg-green-900/50 text-green-300'
+              : result.status === 'error'
+              ? 'bg-red-900/50 text-red-300'
+              : 'bg-yellow-900/50 text-yellow-300'
+          }`}
+        >
+          {statusLabel}
+        </span>
       </div>
 
-      {/* Two-column layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20 }}>
-        {/* Left: radar + log */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: '30px 20px' }}>
-            <RadarBg sweep={false} rings={false} blobs style={{ opacity: 0.5 }} />
-            <div style={{ position: 'relative' }}>
-              {/* Active agent pill */}
-              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}>
-                <span className="pill">
-                  <span className="dot dot-pulse" style={{ background: activeAgent ? activeAgent.hex : '#34d399' }} />
-                  {activeAgent ? `${activeAgent.name} working…` : overall >= 100 ? 'Ship Report ready' : 'Initializing crew'}
-                </span>
-              </div>
+      {result?.error && (
+        <p className="text-red-400 text-sm">{result.error}</p>
+      )}
 
-              <PipelineRadar statuses={statuses} />
-
-              {/* Progress bar */}
-              <div style={{ marginTop: 20 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <span className="eyebrow">Overall progress</span>
-                  <span style={{ fontWeight: 800, fontSize: 16, color: '#fff' }}>{overall}%</span>
-                </div>
-                <div className="track" style={{ height: 8 }}>
-                  <i style={{ width: `${overall}%`, background: 'linear-gradient(90deg,#10b981,#3b82f6,#8b5cf6)', transition: 'width .5s' }} />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <LiveActivityLog lines={logs} height={200} title="Agent Activity Log" />
-        </div>
-
-        {/* Right: per-agent cards */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {AGENTS.map((agent, i) => {
-            const st = statuses[i] as 'pending' | 'running' | 'complete' | 'error';
-            const agentMatch = agents.find(a => ID_TO_INDEX[a.id] === i);
-            const realPct = agentMatch && progressByAgent ? progressByAgent[agentMatch.id] : undefined;
-            const progress = st === 'complete' ? 100
-              : st === 'error' ? 100
-              : (realPct !== undefined ? realPct : (st === 'running' ? 55 : 0));
-            const stats = st === 'complete' ? [
-              { k: agent.key === 'repolens' ? 'deps' : agent.key === 'guardrail' ? 'findings' : agent.key === 'testpilot' ? 'tests' : 'steps', v: agent.key === 'repolens' ? '1.1k' : agent.key === 'guardrail' ? '6' : agent.key === 'testpilot' ? '4' : '4' },
-              { k: 'score', v: '—', color: agent.hex },
-            ] : undefined;
-            return (
-              <AgentCard key={agent.key} agent={agent} status={st} progress={progress} compact stats={stats} />
-            );
-          })}
-        </div>
-      </div>
-    </motion.div>
+      {result?.result && (
+        <pre className="text-gray-300 text-sm overflow-auto max-h-64 bg-gray-800 rounded p-3 mt-2">
+          {typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result, null, 2)}
+        </pre>
+      )}
+    </div>
   );
 }
