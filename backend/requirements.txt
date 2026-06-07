@@ -1,6 +1,10 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-httpx>=0.23.0
+# Cap below 0.28: fastapi 0.104.1 bundles starlette 0.27.x, whose TestClient
+# passes app= to httpx.Client.__init__ — a shortcut httpx REMOVED in 0.28.0.
+# An unpinned httpx resolves to 0.28+ in CI's clean install and every
+# TestClient(app) test errors with "unexpected keyword argument 'app'".
+httpx>=0.23.0,<0.28
 python-dotenv==1.0.0
 pydantic>=2.0.0,<3.0.0
 aiofiles>=23.0.0
