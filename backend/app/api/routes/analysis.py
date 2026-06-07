@@ -81,47 +81,19 @@ async def _verify_repo_write_access(token: str, owner: str, repo: str) -> None:
         )
 
 
-async def _stream_analysis(repo_context):
-    """
-    Async generator that yields SSE-formatted frames for each agent result.
-    
-    Yields agent results as they complete, then sends a final [DONE] sentinel.
-    """
-    async for agent_result in _orchestrator.run(repo_context):
-        frame = f"data: {json.dumps(agent_result)}\n\n"
-        yield frame
-    
-    # Send final sentinel
-    yield "data: [DONE]\n\n"
-
-
-@router.post("/analyze")
-async def analyze(request: AnalyzeRequest):
-    """
-    Run the ShipMate 4-agent analysis pipeline on a GitHub repository.
-
-    Flow:
-      1. Verify the token has write access to owner/repo
-      2. Fetch repo tree + key files from GitHub
-      3. RepoLens  → tech stack, architecture, risks
-      4. PlanForge → milestones, blockers, delivery plan
-      5. GuardRail → security findings, secrets, CORS, auth
-      6. TestPilot → coverage gaps, suggested tests
-      7. Score → weighted readiness score (0-100)
-      8. Stream results as SSE frames
-    """
+async def _build_context_or_502(request: AnalyzeRequest):
+    """Shared prelude for both analyze endpoints: validate, authorize, fetch
+    repo context. Raises HTTPException on any failure."""
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
 
-    # --- Authorization check: token must have write access to the target repo ---
+    # Authorization check: token must have write access to the target repo.
     await _verify_repo_write_access(
-        token=request.access_token,
-        owner=request.owner,
-        repo=request.repo,
+        token=request.access_token, owner=request.owner, repo=request.repo,
     )
 
     try:
-        repo_context = await RepoAnalysisService.build_context(
+        return await RepoAnalysisService.build_context(
             token=request.access_token,
             owner=request.owner,
             repo=request.repo,
@@ -132,14 +104,45 @@ async def analyze(request: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to fetch repository data from GitHub: {str(e)}"
+            detail=f"Failed to fetch repository data from GitHub: {str(e)}",
         )
 
+
+@router.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(request: AnalyzeRequest):
+    """
+    Run the ShipMate 4-agent analysis pipeline and return the full report.
+
+    Non-streaming JSON contract (status + ShipMateReport). This is the stable
+    API the web UI's "Run Analysis", the autonomous loop, and the CLI loop all
+    consume. For incremental per-agent updates use POST /api/analyze/stream.
+
+    Flow: RepoLens → PlanForge / GuardRail / TestPilot → Score → report.
+    """
+    repo_context = await _build_context_or_502(request)
+    try:
+        report = _orchestrator.run(repo_context)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
+    return AnalyzeResponse(status="complete", report=report)
+
+
+async def _stream_analysis(repo_context):
+    """Yield one SSE `data:` frame per agent result, then a `[DONE]` sentinel.
+    The final frame carries {"agent": "report", "output": <full report>}."""
+    async for agent_result in _orchestrator.run_stream(repo_context):
+        yield f"data: {json.dumps(agent_result)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/analyze/stream")
+async def analyze_stream(request: AnalyzeRequest):
+    """Streaming (SSE) variant of /analyze: emits each agent's result as it
+    completes, then a final assembled-report frame and a [DONE] sentinel.
+    Same auth + context-building as /analyze."""
+    repo_context = await _build_context_or_502(request)
     return StreamingResponse(
         _stream_analysis(repo_context),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

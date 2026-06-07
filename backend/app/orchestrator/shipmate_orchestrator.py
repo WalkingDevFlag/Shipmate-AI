@@ -29,23 +29,31 @@ class ShipMateOrchestrator:
         self.guardrail = GuardRailAgent()
         self.testpilot = TestPilotAgent()
 
-    async def run(self, repo_context: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+    def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
         """
-        Async generator that yields each agent's result incrementally.
+        Run the full pipeline synchronously and return the assembled report.
 
-        Args:
-            repo_context: dict with keys:
-                - repo_info: dict (from GitHub API)
-                - file_tree: List[str]
-                - key_files: Dict[str, str]
-                - branch: str
-                - feature_context: str (optional)
-                - pr_info: dict (optional)
+        Canonical entry point used by POST /api/analyze and the autonomous loop
+        (auto_fix). MUST stay sync-returning-ShipMateReport — callers do
+        `report = orchestrator.run(ctx); report.model_dump()`. The incremental
+        SSE variant is `run_stream` below; keep the two in sync.
+        """
+        repo_lens_out = self.repo_lens.run(repo_context)
+        enriched = {**repo_context, "repo_lens": repo_lens_out}
+        plan_forge_out = self.plan_forge.run(enriched)
+        guardrail_out = self.guardrail.run(enriched)
+        testpilot_out = self.testpilot.run(enriched)
+        return self.assemble_report(
+            repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out,
+        )
 
-        Yields:
-            Dict with keys:
-                - agent: str (agent name)
-                - output: agent result dict
+    async def run_stream(self, repo_context: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Async generator yielding each agent's result incrementally, then a
+        final assembled report. Backs the SSE endpoint POST /api/analyze/stream.
+
+        Yields {"agent": <name>, "output": <result>} per agent, then
+        {"agent": "report", "output": <ShipMateReport dict>} last.
         """
         # ── Step 1: RepoLens (must run first — other agents need its output) ──
         repo_lens_out = self.repo_lens.run(repo_context)
@@ -63,6 +71,12 @@ class ShipMateOrchestrator:
 
         testpilot_out = self.testpilot.run(enriched)
         yield {"agent": "testpilot", "output": testpilot_out}
+
+        # ── Final: assembled report (score + full data) ──
+        report = self.assemble_report(
+            repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out,
+        )
+        yield {"agent": "report", "output": report.model_dump()}
 
     def assemble_report(
         self,
