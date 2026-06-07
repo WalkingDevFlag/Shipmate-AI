@@ -150,13 +150,13 @@ jobs:
           # fixture for the root cause that made this necessary). -rfE names
           # any failures/errors in the summary without full verbosity.
           PYTHONPATH=. pytest \
-            --tb=short -rfE \
-            --timeout=60 --timeout-method=thread \
+            --tb=line -rA \
+            --timeout=30 --timeout-method=thread \
             --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term \
             --cov-fail-under=${{ env.COV_FAIL_UNDER }} \
             --junitxml=reports/junit.xml \
             --continue-on-collection-errors \
-            -q
+            -v -s
 
       - name: Upload test reports (CIWatcher consumes junit.xml)
         if: always()  # upload even on failure — the watcher needs the failures
