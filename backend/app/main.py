@@ -423,10 +423,24 @@ async def sanitize_input_middleware(request: Request, call_next):
                         status_code=400,
                         content={"detail": "Request contains disallowed content"},
                     )
-                # Cache the body bytes back onto the request so downstream handlers
-                # (Pydantic model binding, route handlers calling await request.body())
-                # can still access the full payload.
+                # Re-inject the consumed body so downstream handlers can read it.
+                # We rebuild the ASGI receive channel rather than only setting
+                # request._body: under an ASGI test transport, the downstream
+                # route constructs its OWN Request from the scope and calls
+                # receive() to read the body — if the stream is drained and we
+                # only stashed _body on THIS Request instance, that receive()
+                # blocks forever (observed as a selector.select hang on Linux
+                # CI). A receive() that replays the cached bytes is what every
+                # consumer (Starlette Request.body, Pydantic binding) honours.
                 request._body = body_bytes
+
+                async def _replay_receive() -> dict:
+                    return {
+                        "type": "http.request",
+                        "body": body_bytes,
+                        "more_body": False,
+                    }
+                request = Request(request.scope, receive=_replay_receive)
             except Exception:
                 pass  # Don't crash on body-read errors; let the route handle it
 
