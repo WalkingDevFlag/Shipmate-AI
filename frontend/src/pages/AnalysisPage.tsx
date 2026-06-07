@@ -8,6 +8,7 @@ import { Spinner } from '../components/ui/GitHubConnectButton';
 import { RadarBg } from '../components/ui/RadarBg';
 import type { LogLine } from '../components/ui/LiveActivityLog';
 import type { GitHubRepo, GitHubPR, AgentProgress } from '../types';
+import { api } from '../lib/api';
 
 /* ---------- Pipeline Radar ---------- */
 function PipelineRadar({ statuses }: { statuses: string[] }) {
@@ -157,6 +158,60 @@ interface Props {
 
 export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, onCancel }: Props) {
   const logs = useActivityLog(true);
+  const [agentStates, setAgentStates] = useState<Record<string, AgentProgress>>({
+    repo_lens: { id: 'repo_lens', status: 'idle' },
+    plan_forge: { id: 'plan_forge', status: 'idle' },
+    guardrail: { id: 'guardrail', status: 'idle' },
+    testpilot: { id: 'testpilot', status: 'idle' },
+  });
+  const [isComplete, setIsComplete] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    // Start consuming the SSE stream when component mounts
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const consumeStream = async () => {
+      if (!selectedRepo) return;
+
+      try {
+        await api.analyzeStream(
+          {
+            owner: selectedRepo.owner.login,
+            repo: selectedRepo.name,
+            branch: selectedBranch,
+            access_token: '', // Token should be passed from parent or context
+          },
+          (event) => {
+            // Handle agent result event
+            if (event.agent && event.output) {
+              setAgentStates(prev => ({
+                ...prev,
+                [event.agent]: {
+                  id: event.agent,
+                  status: 'complete',
+                },
+              }));
+            }
+          },
+          controller.signal,
+        );
+        // Stream ended successfully
+        setIsComplete(true);
+      } catch (err) {
+        if (err instanceof Error && err.name !== 'AbortError') {
+          console.error('Stream error:', err);
+        }
+      }
+    };
+
+    consumeStream();
+
+    return () => {
+      controller.abort();
+    };
+  }, [selectedRepo, selectedBranch]);
 
   const statuses = AGENTS.map((_, i) => {
     const match = agents.find(a => ID_TO_INDEX[a.id] === i);
