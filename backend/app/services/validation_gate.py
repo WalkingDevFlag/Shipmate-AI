@@ -588,7 +588,19 @@ def _stripped_env(home_dir: Optional[str] = None) -> Dict[str, str]:
     callers), HOME is simply absent — never the real one."""
     keep: Dict[str, str] = {}
     # HOME deliberately excluded from this inherit list — it's set below.
-    for var in ("PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"):
+    # LD_LIBRARY_PATH / DYLD_LIBRARY_PATH are the dynamic-loader search paths for
+    # OUR OWN interpreter — they are NOT secrets (they point at the Python
+    # install dir, already discoverable via PATH/sys.executable). They MUST be
+    # preserved: GitHub's setup-python toolcache interpreter is dynamically
+    # linked against libpython in …/x64/lib and cannot even START without
+    # LD_LIBRARY_PATH — stripping it made the nested `python -m pytest` exit 127
+    # (loader failure) on the Linux runner before pytest ran, while passing on
+    # macOS/Homebrew Python (lib path baked into rpath). Keeping them is safe and
+    # necessary for the target-repo gate's subprocess to launch.
+    for var in (
+        "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT",
+        "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    ):
         if var in os.environ:
             keep[var] = os.environ[var]
     if home_dir:

@@ -67,6 +67,25 @@ def test_stripped_env_omits_secrets(monkeypatch):
     assert env.get("SHIPMATE_SANDBOX") == "1"
 
 
+def test_stripped_env_preserves_loader_paths(monkeypatch):
+    """Regression: the dynamic-loader search paths must survive the strip.
+
+    GitHub's setup-python toolcache interpreter is dynamically linked against
+    libpython in …/x64/lib and CANNOT START without LD_LIBRARY_PATH. Stripping
+    it made the target-repo gate's nested `python -m pytest` exit 127 (loader
+    failure) on the Linux CI runner — before pytest ran — while passing on
+    macOS. These are our own interpreter's lib paths, not secrets, so they must
+    be inherited."""
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hostedtoolcache/Python/3.11/x64/lib")
+    monkeypatch.setenv("DYLD_LIBRARY_PATH", "/usr/local/lib")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "supersecret")  # still a secret
+    env = vg._stripped_env()
+    assert env.get("LD_LIBRARY_PATH") == "/opt/hostedtoolcache/Python/3.11/x64/lib"
+    assert env.get("DYLD_LIBRARY_PATH") == "/usr/local/lib"
+    # …but the strip still drops real secrets.
+    assert "GITHUB_CLIENT_SECRET" not in env
+
+
 # ── flag gating ──────────────────────────────────────────────────────────────
 
 def test_gate_disabled_by_default(monkeypatch):
