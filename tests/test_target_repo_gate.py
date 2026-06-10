@@ -13,14 +13,11 @@ import pytest
 # Minimal stubs so the module can be imported without the full app stack
 # ---------------------------------------------------------------------------
 
-# We import the gate module under test directly; keep the import path consistent
-# with however the project exposes it.
+# We import the gate module under test directly; keep the import path
+# consistent with however the project exposes it.
 try:
-    from app.services.validation_gate import (
-        GateResult,
-        run_target_repo_gate,
-    )
-except Exception:  # pragma: no cover – import guard only
+    from app.services.validation_gate import TargetRepoGate, GateResult
+except Exception:  # pragma: no cover – collected only when app is present
     pytest.skip("validation_gate not importable", allow_module_level=True)
 
 
@@ -28,45 +25,62 @@ except Exception:  # pragma: no cover – import guard only
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_passing_suite(repo: Path) -> None:
-    """Plant a minimal passing pytest suite inside *repo*."""
-    (repo / "tests").mkdir(parents=True, exist_ok=True)
-    (repo / "tests" / "test_trivial.py").write_text(
+def _make_simple_repo(tmp_path: Path) -> Path:
+    """Create a minimal Python project with one passing test."""
+    (tmp_path / "mymod.py").write_text("def add(a, b): return a + b\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("")
+    (tests_dir / "test_mymod.py").write_text(
         textwrap.dedent("""\
-            def test_always_passes():
-                assert 1 + 1 == 2
+            from mymod import add
+
+            def test_add():
+                assert add(1, 2) == 3
         """)
     )
+    return tmp_path
 
 
-def _write_failing_suite(repo: Path) -> None:
-    """Plant a minimal failing pytest suite inside *repo*."""
-    (repo / "tests").mkdir(parents=True, exist_ok=True)
-    (repo / "tests" / "test_broken.py").write_text(
+def _make_failing_repo(tmp_path: Path) -> Path:
+    """Create a minimal Python project with one failing test."""
+    (tmp_path / "mymod.py").write_text("def add(a, b): return a + b\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("")
+    (tests_dir / "test_mymod.py").write_text(
         textwrap.dedent("""\
-            def test_always_fails():
-                assert False, "intentional failure"
+            from mymod import add
+
+            def test_add_wrong():
+                assert add(1, 2) == 99  # intentionally wrong
         """)
     )
+    return tmp_path
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
-
-def test_runs_detected_pytest_in_clone(tmp_path: Path) -> None:
-    """Gate passes when the cloned repo's own tests are green."""
-    _write_passing_suite(tmp_path)
-
-    res = run_target_repo_gate(repo_path=tmp_path, pytest_cmd=[sys.executable, "-m", "pytest"])
+def test_runs_detected_pytest_in_clone(tmp_path):
+    repo_dir = _make_simple_repo(tmp_path)
+    gate = TargetRepoGate(repo_path=repo_dir)
+    res: GateResult = gate.run()
     assert res.passed is True, res.reason
 
 
-def test_failing_target_tests_reject_the_patch(tmp_path: Path) -> None:
-    """Gate fails (and reports >=1 failure) when the repo's tests are red."""
-    _write_failing_suite(tmp_path)
+def test_passing_target_tests_accept_the_patch(tmp_path):
+    repo_dir = _make_simple_repo(tmp_path)
+    gate = TargetRepoGate(repo_path=repo_dir)
+    res: GateResult = gate.run()
+    assert res.passed is True
+    assert res.failed == 0
 
-    res = run_target_repo_gate(repo_path=tmp_path, pytest_cmd=[sys.executable, "-m", "pytest"])
+
+def test_failing_target_tests_reject_the_patch(tmp_path):
+    repo_dir = _make_failing_repo(tmp_path)
+    gate = TargetRepoGate(repo_path=repo_dir)
+    res: GateResult = gate.run()
     assert res.passed is False
     assert res.failed >= 1
