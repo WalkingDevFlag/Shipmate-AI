@@ -388,7 +388,7 @@ class LLMService:
             # Reports→PlanForge: the model never saw what already exists and had
             # no memory of what it proposed before.
             code_blob = _repo_code_blob(
-                context, max_files=8, max_chars_per_file=3500,
+                context, max_files=8,
                 prefer=("routes", "main", "api", "service", "agent",
                         "orchestrator", "components", "pages", "hooks", "lib"),
             )
@@ -449,7 +449,7 @@ class LLMService:
 
         try:
             code_blob = _repo_code_blob(
-                context, max_files=6, max_chars_per_file=3500,
+                context, max_files=6,
                 prefer=("auth", "cors", "main", "security", ".env", "config", "routes"),
             )
             # Recurrence-aware (same as PlanForge/Opportunity discovery): tell the
@@ -583,7 +583,7 @@ class LLMService:
 
         try:
             code_blob = _repo_code_blob(
-                context, max_files=6, max_chars_per_file=3500,
+                context, max_files=6,
                 prefer=("routes", "main", "api", "service", "agent", "handler"),
             )
             user = _user_prompt_testpilot_discovery(context, base, code_blob)
@@ -608,7 +608,7 @@ class LLMService:
         the discoverer saw — same contract as finding_critic using the agent's
         code_blob."""
         return _repo_code_blob(
-            context, max_files=8, max_chars_per_file=3500,
+            context, max_files=8,
             prefer=("routes", "main", "api", "service", "agent",
                     "orchestrator", "components", "pages", "hooks", "lib"),
         )
@@ -758,24 +758,64 @@ class OpportunityDiscovery(BaseModel):
 
 # ─── Discovery — code-blob builder ───────────────────────────────────────────
 
+# Total body budget for the discovery code blob, in CHARS (≈ chars/4 tokens).
+# Design: this is MAP-FIRST. The cheap SYMBOL MAP (signatures of every parseable
+# file) gives breadth — the model can NAME any file as relevant — so the body
+# budget only needs to carry the top-scored files' code for discovery context,
+# NOT every file in full. The critic gets verification DEPTH separately, from
+# finding_critic.finding_aware_code_blob (full content of CITED files). So this
+# budget is deliberately set BELOW the old worst case (8 files × 3500 = 28000)
+# to actually reduce tokens, not grow them. With the symbol map (~3-5k chars)
+# carrying breadth, a 14k body budget keeps the TOTAL blob at/below the old
+# ~17k worst case — a net token reduction WITH the blindness fix, not a trade.
+# Env-tunable for big monorepos.
+_CONTEXT_BUDGET_CHARS = int(os.getenv("SHIPMATE_CONTEXT_BUDGET_CHARS", "14000"))
+
+# Chars reserved for the elision marker inside a head+tail slice, so the sliced
+# result never exceeds the caller's budget.
+_ELISION_MARKER_CHARS = 50
+
+
+def _head_tail(content: str, budget: int) -> str:
+    """Slice a too-large file to AT MOST `budget` chars (marker included),
+    keeping BOTH ends — the head (imports, top-level wiring) and the tail
+    (late-defined gates/guards a head-only cut would hide). ~60% head / 40%
+    tail. For a budget too small to slice meaningfully, return a plain head cut."""
+    if len(content) <= budget:
+        return content
+    if budget <= _ELISION_MARKER_CHARS + 20:
+        return content[:max(budget, 0)]
+    body_budget = budget - _ELISION_MARKER_CHARS
+    head = int(body_budget * 0.6)
+    tail = body_budget - head
+    omitted = len(content) - body_budget
+    marker = f"\n\n# … [{omitted} chars elided — middle of file] …\n\n"
+    return content[:head] + marker + (content[-tail:] if tail > 0 else "")
+
+
 def _repo_code_blob(
     context: Dict[str, Any],
     max_files: int = 5,
-    max_chars_per_file: int = 3500,
+    max_chars_per_file: int = 3500,  # retained for back-compat; superseded by budget
     prefer: tuple = (),
+    budget_chars: Optional[int] = None,
 ) -> str:
     """
-    Build a compact text blob containing the file tree + the top-N most
-    relevant file contents for the LLM to reason about.
+    Build a compact, MAP-FIRST text blob: a symbol skeleton of every parseable
+    file (so no symbol is ever fully invisible), the file tree, then the bodies
+    of the top-scored files filled to a token-aware budget (no blind per-file
+    tail truncation).
 
     `prefer`: substrings that boost a file's relevance score. e.g. ("auth",
     "cors") for the GuardRail discovery pass. RepoLens entry_points are
-    always given top priority.
+    always given top priority. `budget_chars` overrides the global default for
+    the total BODY budget (the symbol map + tree are cheap and not counted).
     """
     file_tree: List[str] = context.get("file_tree") or []
     key_files: Dict[str, str] = context.get("key_files") or {}
     repo_lens = context.get("repo_lens")
     entry_points = list(repo_lens.entry_points) if repo_lens else []
+    budget = budget_chars if budget_chars is not None else _CONTEXT_BUDGET_CHARS
 
     # Score every key_file path by how relevant it looks.
     def _score(path: str) -> int:
@@ -806,25 +846,79 @@ def _repo_code_blob(
         candidates = [(p, c) for p, c in key_files.items() if c]
 
     candidates.sort(key=lambda pc: _score(pc[0]), reverse=True)
-    selected = candidates[:max_files]
 
     lines: List[str] = []
+
+    # ── MAP FIRST — a symbol skeleton of EVERY parseable file we have. This is
+    # the "find, don't chug" half: even a file whose body doesn't fit the budget
+    # still has its importable symbols visible here, so the model can NAME it as
+    # relevant instead of being blind to it. Reuses the same ast-export
+    # extraction the Coder repo-map and the import lint use.
+    try:
+        from app.services.repo_map import _render_symbols
+        symbol_map = _render_symbols(
+            {p: c for p, c in candidates}, [p for p, _ in candidates],
+        )
+    except Exception:  # pragma: no cover - fail-open to no map
+        symbol_map = ""
+    if symbol_map:
+        lines.append("## Symbol map — modules and their exported symbols")
+        lines.append(symbol_map)
+        lines.append("")
+
     if file_tree:
         # Top of the tree — first 60 paths is plenty of structural context.
         lines.append("## File tree (first 60 entries)")
         lines.extend(f"- {p}" for p in file_tree[:60])
         lines.append("")
 
-    if selected:
-        lines.append(f"## Top {len(selected)} files (truncated to {max_chars_per_file} chars each)")
-        for path, content in selected:
-            snippet = content[:max_chars_per_file]
+    # ── BODIES — fill to a token-aware budget, scored order. A file shown is
+    # shown WHOLE (no tail hidden); the single file that overflows the remaining
+    # budget is head+tail-sliced; everything past the budget becomes a name-only
+    # list so the model knows the file exists (and its symbols are in the map).
+    # Note: discovery breadth comes from the symbol map; verification DEPTH for a
+    # specific finding comes from the critic's finding_aware_code_blob (full
+    # cited files), so a body that lands in the name list is not "blind" — its
+    # symbols are mapped and the critic re-fetches it in full if it's cited.
+    shown: List[tuple] = []
+    overflow: List[str] = []
+    spent = 0
+    for idx, (path, content) in enumerate(candidates):
+        remaining = budget - spent
+        if len(shown) >= max_files or remaining <= 0:
+            overflow.append(path)
+            continue
+        if len(content) <= remaining:
+            shown.append((path, content))
+            spent += len(content)
+        else:
+            # Doesn't fully fit — give it the rest of the budget head+tail-sliced
+            # (keeps BOTH ends, so a deep tail gate stays visible), then stop
+            # adding bodies. Use the loop index (not list.index, which would
+            # ValueError on duplicate content) to push the rest to the name list.
+            shown.append((path, _head_tail(content, remaining)))
+            spent = budget
+            overflow.extend(p for p, _ in candidates[idx + 1:])
+            break
+
+    if shown:
+        lines.append(f"## Top {len(shown)} files (full content; budget-filled)")
+        for path, content in shown:
             lines.append(f"\n### `{path}`")
             lines.append("```")
-            lines.append(snippet)
-            if len(content) > max_chars_per_file:
-                lines.append(f"... [truncated; {len(content) - max_chars_per_file} more chars]")
+            lines.append(content)
             lines.append("```")
+
+    if overflow:
+        # De-dup while preserving order; cap the list so a huge repo can't bloat.
+        seen: set = set()
+        uniq = [p for p in overflow if not (p in seen or seen.add(p))]
+        lines.append("")
+        lines.append(
+            f"## Other files present (not shown in full — see symbol map above): "
+            + ", ".join(f"`{p}`" for p in uniq[:40])
+            + (f" (+{len(uniq) - 40} more)" if len(uniq) > 40 else "")
+        )
 
     return "\n".join(lines) if lines else "(no repo content available)"
 

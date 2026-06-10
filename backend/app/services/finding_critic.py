@@ -204,13 +204,16 @@ def finding_aware_code_blob(
     """Build a critic code blob that includes the FULL content of the files the
     findings CITE — not the truncated top-N blob.
 
-    Why this exists (the critic's blindfold): the default LLM blob truncates
-    every file to ~3500 chars. A defensive control often lives further down a
-    large file (e.g. main.py's `_TRUST_PROXY_HEADERS` / `_get_client_ip` gate at
-    char ~6188), so the critic literally cannot see the defense it's supposed to
-    credit — and conservatively keeps the false positive. By pulling the full
-    body of each cited file (capped, and capped in count) we guarantee the
-    control is in the critic's view.
+    Why this exists (the critic's blindfold): the discovery LLM blob is
+    MAP-FIRST + budget-filled — it carries a symbol map of every file but only
+    the top-scored file BODIES, so a cited file can land in the name-only
+    overflow list with just its symbols shown. A defensive control often lives
+    in the body of such a file (e.g. main.py's `_TRUST_PROXY_HEADERS` /
+    `_get_client_ip` gate), so the critic would see the symbol name but not the
+    implementation it's supposed to credit — and conservatively keeps the false
+    positive. By pulling the full body of each CITED file (capped, and capped in
+    count) we guarantee the control's actual code is in the critic's view. This
+    is the verification-DEPTH half; the discovery blob is the breadth half.
 
     Returns `fallback_blob` (the old truncated blob) PLUS the cited-file
     sections, so the critic keeps broad context AND gets the specific files in
