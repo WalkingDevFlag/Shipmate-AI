@@ -61,6 +61,93 @@ _EVAL_GATE_ENABLED = os.getenv("SHIPMATE_EVAL_GATE", "0").strip().lower() in ("1
 # can't pin the actuate worker thread indefinitely (the gather had no timeout).
 _FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FETCH_TIMEOUT_S", "45"))
 
+# Hard ceiling per Coder LLM call. Without this a stalled provider response
+# pins the worker thread (and, via actuate_stream, the SSE connection) for the
+# full request — observed at ~900s when two large full-file generations ran
+# concurrently. Set DELIBERATELY BELOW the shared provider read_timeout (300s,
+# bedrock_provider.py) so this guard frees the awaiting request/SSE first; the
+# orphaned worker thread then drains on the provider's own read-timeout. We do
+# NOT lower the provider timeout itself — that client is a process-wide
+# singleton shared with the planner/repo_analyst agents, whose legitimate calls
+# can run long. Mirrors the _FETCH_TIMEOUT_S guard already used for GitHub I/O.
+_LLM_TIMEOUT_S = float(os.getenv("SHIPMATE_LLM_TIMEOUT_S", "240"))
+
+# Auto-engage diff mode when any target file is at least this many lines. Full
+# rewrites of large files are slow (timeout risk) and tempt the model to bail
+# to `skipped`. Diff mode emits a small unified diff instead, auto-falling back
+# to full-file if the diff fails to apply.
+_DIFF_AUTO_LINES = int(os.getenv("SHIPMATE_DIFF_AUTO_LINES", "400"))
+
+
+async def _run_coder(agent: "CoderAgent", *args) -> "CoderOutput":
+    """Bound a single Coder call so a hung provider can't pin the request/SSE
+    indefinitely. Raises asyncio.TimeoutError on expiry; run_actuation maps it
+    to status='timeout'. Note: cancelling the to_thread frees the awaiting
+    coroutine but cannot kill the worker thread — the thread drains when the
+    provider's own read_timeout (300s, > this deadline) fires. Bounding the
+    request promptly is the point; the thread cleans up shortly after."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(agent.run, *args), _LLM_TIMEOUT_S,
+    )
+
+
+async def _run_coder_feedback(agent, brief, issues, hint) -> "CoderOutput":
+    """Bounded re-prompt that feeds concrete issues back to the Coder. Same
+    deadline as _run_coder; used by the phantom-patch guard for its one retry."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(agent.run_with_lint_feedback, brief, issues, hint),
+        _LLM_TIMEOUT_S,
+    )
+
+
+# Feedback fed to the Coder when its first response was an empty patch that
+# nonetheless claimed a fix (phantom). Names the contradiction explicitly.
+_PHANTOM_FEEDBACK = [
+    "Your previous response returned ZERO file edits but the summary described "
+    "a change as if it had been made. That is a phantom patch and is rejected. "
+    "Either emit the ACTUAL complete file content for every file you change, or "
+    "— if you genuinely cannot make this change — return no files and set the "
+    "summary to exactly 'DECLINED: <one-line reason>'. Do not write a VERIFY "
+    "line on an empty patch.",
+]
+
+
+def _looks_like_phantom(coder_out) -> bool:
+    """A phantom patch = zero file edits AND a summary that reads like a fix was
+    made (carries the mandatory 'VERIFY:' self-check stamp, or is a multi-word
+    narration) rather than an honest 'DECLINED:'. An explicit decline is NOT a
+    phantom — we only retry the dishonest-looking empties."""
+    if getattr(coder_out, "files", None):
+        return False
+    summary = (getattr(coder_out, "summary", "") or "").strip()
+    if not summary:
+        return False
+    low = summary.lower()
+    if low.startswith("declined"):
+        return False  # honest decline — accept as-is, don't retry
+    # Clean VERIFY stamp on an empty patch is the signature contradiction; a
+    # long narration without a decline is also suspect.
+    return ("verify:" in low and "fail:" not in low) or len(summary.split()) >= 8
+
+
+def _honest_empty_summary(coder_out) -> str:
+    """Strip a phantom's clean VERIFY stamp from the user-facing summary so an
+    empty patch never reports as a clean success. Honest declines pass through."""
+    summary = (getattr(coder_out, "summary", "") if coder_out else "") or ""
+    summary = summary.strip()
+    if not summary:
+        return "Coder produced no patch."
+    if summary.lower().startswith("declined"):
+        return summary
+    # Strip the VERIFY stamp wherever it sits (own line OR inline, since the
+    # model often appends it to the last sentence) — it would otherwise read as
+    # a passed check on an empty patch. Cut from the first 'VERIFY:' onward.
+    low = summary.lower()
+    idx = low.find("verify:")
+    cleaned = (summary[:idx] if idx != -1 else summary).strip()
+    cleaned = " ".join(cleaned.split()) or "(no detail)"
+    return f"No patch produced (Coder returned no file edits). Coder note: {cleaned[:240]}"
+
 # The repo this backend checkout corresponds to. The pytest gate only fires
 # when the actuate target matches — otherwise we'd be running ShipMate's own
 # tests against a patch meant for someone else's repo.
@@ -366,6 +453,13 @@ def _lint_coder_output(
     benefit from AST).
     """
     issues: List[str] = []
+    # Files created IN THIS patch are valid import targets even though they
+    # are not in the existing GitHub tree yet. Without this, the textbook
+    # "extract into a shared module" refactor (create app/services/sse.py AND
+    # `from app.services.sse import …` in the same patch) is wrongly rejected
+    # as a hallucinated import. The stale-named check below already trusts
+    # coder_out.files; the existence check (detect_bad_imports) must too.
+    tree_with_patch = list(file_tree) + [cf.path for cf in coder_out.files]
     for cf in coder_out.files:
         original = target_files.get(cf.path, "")
 
@@ -376,7 +470,7 @@ def _lint_coder_output(
                 issues.append(syntax_err)
                 continue  # skip further checks — they'd just re-report the parse failure
 
-            bad = ast_lint.detect_bad_imports(cf.new_content, original, file_tree)
+            bad = ast_lint.detect_bad_imports(cf.new_content, original, tree_with_patch)
             if bad:
                 issues.append(
                     f"{cf.path}: hallucinated first-party imports not in repo or "
@@ -563,8 +657,10 @@ class CoderOrchestrator:
                 finding_severity=req.finding.severity,
                 finding_category=getattr(req.finding, "category", "") or "",
             )
-            step_out: CoderOutput = await asyncio.to_thread(
-                agent.run, step_brief, hint, mode,
+            # Bounded per step — a hung step raises asyncio.TimeoutError, which
+            # propagates to run_actuation's timeout handler (status='timeout').
+            step_out: CoderOutput = await _run_coder(
+                agent, step_brief, hint, mode,
             )
             for cf in step_out.files:
                 merged[cf.path] = cf
@@ -666,7 +762,21 @@ class CoderOrchestrator:
             )
 
         try:
-            loop = await asyncio.to_thread(_drive)
+            # The loop re-prompts the Coder up to verify_loop._DEFAULT_MAX_ITERS
+            # times; bound the whole drive so a hung re-prompt can't pin the
+            # request past a few per-call deadlines. On timeout, degrade to the
+            # pure lint+scope verdict on the candidate we already have rather
+            # than hanging — same fail-open as the exception path below.
+            loop = await asyncio.wait_for(
+                asyncio.to_thread(_drive),
+                _LLM_TIMEOUT_S * (verify_loop._DEFAULT_MAX_ITERS + 1),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "verify-loop exceeded its deadline — pure-check fallback on the "
+                "candidate in hand",
+            )
+            return coder_out, _pure_only_result()
         except Exception as e:  # pragma: no cover - fail-open to pure checks
             logger.warning("verify-loop raised %s — pure-check fallback", e)
             return coder_out, _pure_only_result()
@@ -746,28 +856,83 @@ class CoderOrchestrator:
             finding_category=getattr(req.finding, "category", "") or "",
         )
         agent = CoderAgent()
-        _mode = "diff" if getattr(req, "diff_mode", False) else "full"
-        if getattr(req, "decompose", False):
-            coder_out = await cls._run_decomposed(
-                req, ctx, file_tree, target_files, _mode,
+        # Diff mode when explicitly requested OR auto-engaged for large target
+        # files: reprinting a 1200-line file verbatim to add a 3-line change is
+        # what blows the LLM timeout and tempts the model to bail to `skipped`.
+        # CoderAgent auto-falls-back to full-file on any diff-apply failure, so
+        # this only ever saves work — it never blocks a patch.
+        _auto_diff = any(
+            (c or "").count("\n") + 1 > _DIFF_AUTO_LINES
+            for c in target_files.values()
+        )
+        _mode = "diff" if (getattr(req, "diff_mode", False) or _auto_diff) else "full"
+        if _auto_diff and not getattr(req, "diff_mode", False):
+            logger.info(
+                "auto-engaging diff mode for %s/%s: a target file exceeds %d lines",
+                req.finding.kind, req.finding.id, _DIFF_AUTO_LINES,
             )
-        else:
-            coder_out = await asyncio.to_thread(
-                agent.run, brief, _deployment_hint(req.finding), _mode,
+        try:
+            if getattr(req, "decompose", False):
+                coder_out = await cls._run_decomposed(
+                    req, ctx, file_tree, target_files, _mode,
+                )
+            else:
+                coder_out = await _run_coder(
+                    agent, brief, _deployment_hint(req.finding), _mode,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Coder call exceeded %.0fs for %s/%s — returning timeout",
+                _LLM_TIMEOUT_S, req.finding.kind, req.finding.id,
+            )
+            await _emit("done", status="timeout", pr_url=None)
+            return ActuateResponse(
+                status="timeout",
+                pr_url=None,
+                branch_name=branch_name,
+                files_changed=[],
+                skipped=target_paths,
+                summary=(
+                    f"Coder call exceeded the {_LLM_TIMEOUT_S:.0f}s deadline "
+                    f"(SHIPMATE_LLM_TIMEOUT_S) and was aborted. No patch produced."
+                ),
             )
         await _emit("coding.done", files=[cf.path for cf in coder_out.files])
 
         if not coder_out.files:
-            # Coder decided no change is needed (or skipped everything).
-            await _emit("done", status="no_change", pr_url=None)
-            return ActuateResponse(
-                status="no_change",
-                pr_url=None,
-                branch_name=branch_name,
-                files_changed=[],
-                skipped=coder_out.skipped or target_paths,
-                summary=coder_out.summary or "Coder determined no patch was needed.",
-            )
+            # Empty patch. Distinguish an HONEST decline from a PHANTOM patch —
+            # zero files but a confident VERIFY-clean summary that narrates a
+            # fix it never emitted (observed live on a cross-cutting finding).
+            # On a phantom, re-prompt ONCE with the contradiction made explicit
+            # before accepting no_change; an honest decline is returned as-is.
+            if _looks_like_phantom(coder_out):
+                logger.warning(
+                    "phantom patch for %s/%s (empty files + clean VERIFY) — one retry",
+                    req.finding.kind, req.finding.id,
+                )
+                await _emit("coding.retry", reason="phantom")
+                try:
+                    coder_out = await _run_coder_feedback(
+                        agent, brief, _PHANTOM_FEEDBACK, _deployment_hint(req.finding),
+                    )
+                except asyncio.TimeoutError:
+                    coder_out = None  # fall through to no_change below
+
+            if not coder_out or not coder_out.files:
+                _record_coder_lessons(
+                    f"{req.owner}/{req.repo}", "phantom",
+                    [(getattr(coder_out, "summary", "") or "")[:200]
+                     or "empty patch"],
+                )
+                await _emit("done", status="no_change", pr_url=None)
+                return ActuateResponse(
+                    status="no_change",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=(getattr(coder_out, "skipped", None) or target_paths),
+                    summary=_honest_empty_summary(coder_out),
+                )
 
         # 3b. Inner verify-loop (Phase 4) — iterate the Coder against the CHEAP
         # checks (AST lint + scope guard + sandbox import-smoke) BEFORE touching
@@ -929,8 +1094,8 @@ class CoderOrchestrator:
                         req.finding.kind, req.finding.id, result.reason,
                     )
                     try:
-                        coder_out = await asyncio.to_thread(
-                            agent.run_with_lint_feedback, brief,
+                        coder_out = await _run_coder_feedback(
+                            agent, brief,
                             [f"Your patch broke the test suite: {result.reason}. "
                              "Fix the regression while still addressing the finding."],
                             _deployment_hint(req.finding),
@@ -941,7 +1106,12 @@ class CoderOrchestrator:
                             for cf in coder_out.files
                         ]
                         # Re-lint + re-scope the retry output before re-gating.
-                        if _lint_coder_output(coder_out, target_files, file_tree) or \
+                        # An EMPTY retry (model declined under pressure) must NOT
+                        # count as a pass — an empty patch trivially has no test
+                        # regression, which would otherwise fall through to an
+                        # empty 'complete'. Keep the original rejection instead.
+                        if not coder_out.files or \
+                                _lint_coder_output(coder_out, target_files, file_tree) or \
                                 sg.check_patch(serialized, target_files, coder_out.summary):
                             result, snap = (result, snap)  # keep failed result
                         else:
@@ -1097,6 +1267,34 @@ class CoderOrchestrator:
                                     req.finding.kind, req.finding.id, spec.name)
                 except Exception as e:  # pragma: no cover - fail-open
                     logger.debug("eval gate skipped (fail-open): %s", e)
+
+            # Backstop: never create a branch / return 'complete' for an empty
+            # file set. A gate retry (e.g. the pytest-feedback re-prompt above)
+            # can overwrite coder_out with an empty patch, which would otherwise
+            # fall through to an empty branch + a misleading 'complete' with
+            # files_changed=[] (observed live when auto-diff tripped the retry).
+            # An empty set this late is a no_change, not a success.
+            if not coder_out.files:
+                logger.warning(
+                    "empty file set reached the commit stage for %s/%s "
+                    "(likely a gate retry emptied the patch) — returning no_change",
+                    req.finding.kind, req.finding.id,
+                )
+                _record_coder_lessons(
+                    repo_full, "phantom", ["empty patch after gate retry"],
+                )
+                await _emit("done", status="no_change", pr_url=None)
+                return ActuateResponse(
+                    status="no_change",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=target_paths,
+                    summary=(
+                        "No patch produced — the Coder's gate-retry returned an "
+                        "empty file set, so nothing was committed."
+                    ),
+                )
 
             # 4. Create the branch.
             await _emit("branch.start", branch=branch_name)

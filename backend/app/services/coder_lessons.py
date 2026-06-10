@@ -158,6 +158,15 @@ def distill(gate: str, issue: str) -> Tuple[str, str]:
             "the finding describes, not just compiles."
         )
 
+    if gate == "phantom" or "empty patch" in low or "no files" in low:
+        return "phantom-patch", (
+            "NO PHANTOM PATCHES: a prior response returned ZERO file edits while "
+            "the summary narrated a fix (often with a clean VERIFY line). If you "
+            "make a change, emit the actual file content; if you genuinely "
+            "cannot, set the summary to 'DECLINED: <reason>' — never stamp a "
+            "clean VERIFY on an empty patch."
+        )
+
     # Fallback — keep the gate as the key so repeated generic failures still
     # aggregate, but with a less specific lesson.
     return f"{gate or 'other'}-generic", (

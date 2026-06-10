@@ -147,6 +147,18 @@ _SYSTEM_PROMPT = (
     "is rejected by post-processing — no PR will be opened. The line is "
     "non-optional and not negotiable. Write it.\n\n"
 
+    "## NO PHANTOM PATCHES — the worst violation\n"
+    "A `VERIFY:` line asserts you actually produced the patch. If you return "
+    "ZERO file edits (every target under `skipped`, `files` empty), you MUST "
+    "NOT write a clean `VERIFY:` line — that is a phantom patch that claims a "
+    "fix you never made, and it is the single worst thing you can do. When you "
+    "produce no file edits, your summary MUST instead begin with literally "
+    "`DECLINED: ` followed by a one-line reason (e.g. "
+    "`DECLINED: the change spans 4 large files and needs decomposition`), and "
+    "the VERIFY line MUST read `VERIFY: declined — no patch produced`. Choose "
+    "exactly one: a real patch with a real VERIFY line, or an honest DECLINED "
+    "with no clean VERIFY. Never an empty patch dressed as a success.\n\n"
+
     "## Reminders for tests specifically\n"
     "  • NEVER write `assert response.status_code in [200, 401, 404]` or "
     "any tuple/list of mixed-success-and-error codes. Pick ONE expected "
