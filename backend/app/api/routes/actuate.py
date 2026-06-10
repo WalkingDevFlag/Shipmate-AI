@@ -24,6 +24,15 @@ from app.api.deps import (
 router = APIRouter(tags=["actuate"])
 logger = logging.getLogger("shipmate.actuate_route")
 
+# Maximum number of events buffered per SSE connection before back-pressure
+# causes the producer to block (prevents unbounded heap growth for slow/stalled
+# clients).
+_SSE_QUEUE_MAXSIZE = 256
+
+# Seconds to wait for the next event before treating the client as gone and
+# closing the stream.
+_SSE_IDLE_TIMEOUT_S = 30.0
+
 
 @router.post("/actuate", response_model=ActuateResponse)
 async def actuate(req: ActuateRequest) -> ActuateResponse:
@@ -54,8 +63,12 @@ async def actuate_stream(req: ActuateRequest):
 
     Auth + the run itself happen inside the stream so a failure surfaces as an
     `error` event rather than a pre-stream HTTP error the EventSource can't read.
+
+    The queue is bounded (maxsize=256) and queue.get() has a 30-second idle
+    timeout so stalled/slowloris clients are disconnected rather than leaking
+    memory.
     """
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_SSE_QUEUE_MAXSIZE)
     _SENTINEL = object()
 
     async def on_event(evt: dict) -> None:
@@ -83,7 +96,17 @@ async def actuate_stream(req: ActuateRequest):
         task = asyncio.create_task(_drive())
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_IDLE_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "actuate_stream idle timeout for %s/%s — closing stream",
+                        req.owner, req.repo,
+                    )
+                    yield "event: error\ndata: {\"detail\": \"stream idle timeout\"}\n\n"
+                    break
                 if item is _SENTINEL:
                     break
                 yield f"event: {item.get('event', 'message')}\ndata: {json.dumps(item)}\n\n"
