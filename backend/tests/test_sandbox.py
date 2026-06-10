@@ -107,6 +107,26 @@ class TestDockerArgv:
         argv = sandbox.build_docker_argv("/h", ["npm", "test", "--silent"])
         assert argv[-3:] == ["npm", "test", "--silent"]
 
+    def test_host_python_path_rewritten_to_container_python(self):
+        # Regression: the gate builds the inner cmd with sys.executable (a HOST
+        # path). On GitHub that's /opt/hostedtoolcache/Python/.../bin/python,
+        # which does NOT exist in the image → `docker run` exited 127 before
+        # pytest ran. The interpreter token must be normalized to `python`.
+        host_py = "/opt/hostedtoolcache/Python/3.11.15/x64/bin/python"
+        argv = sandbox.build_docker_argv("/h", [host_py, "-m", "pytest", "-q"])
+        assert argv[-4:] == ["python", "-m", "pytest", "-q"]
+        assert host_py not in argv  # the host path is gone
+
+    def test_non_python_inner_command_unchanged(self):
+        # npm/make commands must pass through verbatim (no interpreter rewrite).
+        assert sandbox._containerize_cmd(["npm", "test"]) == ["npm", "test"]
+        assert sandbox._containerize_cmd(["make", "test"]) == ["make", "test"]
+
+    def test_bare_python_name_left_for_container_path(self):
+        # A bare `python3` (no slash) already resolves on the image PATH — leave
+        # it; only an absolute/relative HOST path needs rewriting.
+        assert sandbox._containerize_cmd(["python3", "-m", "pytest"]) == ["python3", "-m", "pytest"]
+
     def test_resource_caps_overridable_by_env(self, monkeypatch):
         # The caps read module-level defaults; verify the values flow through.
         argv = sandbox.build_docker_argv(

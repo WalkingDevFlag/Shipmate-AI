@@ -439,6 +439,14 @@ def build_docker_argv(
       • --cap-drop ALL, no-new-privileges  minimal capabilities.
       • code mounted :ro at /work; the suite runs from a tmpfs copy it makes, or
         read-only in place (tests that need to write artifacts use /tmp).
+
+    Interpreter normalization: callers build the inner command with
+    `sys.executable` (e.g. `[sys.executable, "-m", "pytest", …]`) so the HOST
+    path works. But that absolute path (e.g. GitHub's
+    /opt/hostedtoolcache/Python/3.11/x64/bin/python) does NOT exist inside the
+    container image, which has its own `python`. Passing the host path made
+    `docker run` exit 127 ("no such file or directory") before pytest ran. So a
+    leading host-Python interpreter token is rewritten to the image's `python`.
     """
     return [
         "docker", "run", "--rm",
@@ -457,8 +465,24 @@ def build_docker_argv(
         "--workdir", "/work",
         "--volume", f"{host_dir}:/work:ro",
         image,
-        *inner_cmd,
+        *_containerize_cmd(inner_cmd),
     ]
+
+
+def _containerize_cmd(inner_cmd: List[str]) -> List[str]:
+    """Rewrite a leading HOST python-interpreter path to the container's
+    `python`. The host's sys.executable (an absolute toolcache/venv path) is not
+    present in the image; the image has `python` on PATH. Only the interpreter
+    token is touched — `-m pytest …` and everything else is passed through. A
+    non-python command (npm test, make test) is returned unchanged."""
+    if not inner_cmd:
+        return inner_cmd
+    first = inner_cmd[0]
+    base = os.path.basename(first)
+    # Absolute/relative path to a python interpreter → use the image's `python`.
+    if ("/" in first or first.endswith((".exe",))) and base.lower().startswith("python"):
+        return ["python", *inner_cmd[1:]]
+    return list(inner_cmd)
 
 
 # ── Per-finding gate tiers ───────────────────────────────────────────────────
