@@ -755,7 +755,17 @@ def gate_patch_target_repo(
 
         # 'tests must not fail' — a non-zero exit with parsed failures rejects.
         ok = failed == 0 and proc.returncode == 0
-        reason = "ok" if ok else f"target tests failed ({failed} failing, exit={proc.returncode})"
+        if ok:
+            reason = "ok"
+        else:
+            # Include a stderr tail on failure — a bare 'exit=127' is
+            # undebuggable (was it a loader failure? missing runner? import
+            # crash?). The parsed counters miss a process that died before
+            # emitting a pytest summary line, so surface the raw tail.
+            err_tail = (proc.stderr or "")[-600:].strip()
+            reason = f"target tests failed ({failed} failing, exit={proc.returncode})"
+            if proc.returncode != 0 and err_tail:
+                reason += f" | stderr: {err_tail}"
         logger.info("gate_patch_target_repo: %s/%s %s (%dp/%df) in %.1fs",
                     owner, repo, "ACCEPT" if ok else "REJECT", passed, failed, elapsed)
         return GateResult(ok, before=passed, after=passed, failed=failed,
