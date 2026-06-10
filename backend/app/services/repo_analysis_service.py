@@ -39,6 +39,16 @@ _KEY_FILE_NAMES = [
 # Max files to fetch (GitHub API rate: 5000 req/hr for authenticated)
 _MAX_KEY_FILES = 18
 
+# Manifests/config that legitimately recur per-package in a monorepo — for these
+# we fetch up to _MAX_MANIFEST_COPIES copies (shallowest first) so dependency
+# extraction sees backend/ AND frontend/ AND services/* deps, not just one.
+# Everything else (README, Makefile, .gitignore, entry files) takes one copy.
+_MULTI_COPY_MANIFESTS = frozenset({
+    "package.json", "requirements.txt", "requirements-dev.txt",
+    "pyproject.toml", "setup.py", "go.mod", "Cargo.toml", "tsconfig.json",
+})
+_MAX_MANIFEST_COPIES = 4
+
 # Overall ceiling on the parallel key-file fetch, so a few hung connections
 # can't stall the whole analyze request (the gather had no outer timeout).
 _FILES_FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FILES_FETCH_TIMEOUT_S", "60"))
@@ -181,24 +191,51 @@ class RepoAnalysisService:
 
     @classmethod
     def _select_key_files(cls, tree: List[str]) -> List[str]:
-        """Pick files to fetch: prioritized list + first workflow yaml."""
-        selected: List[str] = []
-        tree_set = set(tree)
+        """Pick files to fetch: prioritized list + first workflow yaml.
 
+        Matches each name in _KEY_FILE_NAMES against the BASENAME of every tree
+        path — NOT exact equality. The tree holds full paths (e.g.
+        'backend/requirements.txt'), so the old `name in tree_set` check never
+        matched a manifest that lived in a subdirectory: in any monorepo /
+        frontend+backend split the manifests were never fetched, dependency
+        extraction was a no-op, and every downstream agent inherited an empty
+        tech-stack picture. Manifests can legitimately appear in several
+        directories, so for those we collect MULTIPLE copies (shallowest first);
+        single-instance files (README, Makefile, …) take just the shallowest."""
+        selected: List[str] = []
+
+        # Index tree paths by basename, shallowest path first (fewest slashes),
+        # so the root/most-canonical copy leads.
+        by_name: Dict[str, List[str]] = {}
+        for p in tree:
+            by_name.setdefault(Path(p).name, []).append(p)
+        for name in by_name:
+            by_name[name].sort(key=lambda p: (p.count("/"), p))
+
+        # Manifests/configs that genuinely recur per-package in a monorepo — take
+        # up to _MAX_MANIFEST_COPIES of each so multi-directory deps are seen.
         for name in _KEY_FILE_NAMES:
-            if name in tree_set:
-                selected.append(name)
+            matches = by_name.get(name, [])
+            if not matches:
+                continue
+            take = _MAX_MANIFEST_COPIES if name in _MULTI_COPY_MANIFESTS else 1
+            for path in matches[:take]:
+                if path not in selected:
+                    selected.append(path)
             if len(selected) >= _MAX_KEY_FILES:
                 break
 
         # Add first GitHub Actions workflow if present
-        workflows = [f for f in tree if ".github/workflows" in f and f.endswith((".yml", ".yaml"))]
+        workflows = sorted(
+            (f for f in tree if ".github/workflows" in f and f.endswith((".yml", ".yaml"))),
+            key=lambda p: (p.count("/"), p),
+        )
         if workflows and workflows[0] not in selected:
             selected.append(workflows[0])
 
         # Add first entry file not yet in list
         ENTRY_NAMES = {"main.py", "app.py", "server.py", "index.ts", "index.js", "main.ts", "main.js"}
-        for f in tree:
+        for f in sorted(tree, key=lambda p: (p.count("/"), p)):
             if Path(f).name in ENTRY_NAMES and f not in selected:
                 selected.append(f)
                 break

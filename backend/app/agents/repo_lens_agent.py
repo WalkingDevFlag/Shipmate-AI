@@ -141,6 +141,14 @@ class RepoLensAgent(BaseAgent):
             return "monorepo"
         if len(tops) > 6 and any(d in tops for d in ["api", "gateway", "service"]):
             return "microservices"
+        # Tiered web app: a distinct frontend dir AND a distinct backend dir.
+        # ShipMate itself (backend/ + frontend/) is the canonical case — the old
+        # classifier fell through to "monolith", misleading every downstream
+        # agent about deployment shape (independent FE/BE scaling, cross-layer
+        # contract/version-skew risks). Checked before library/monolith.
+        if ({"frontend", "web", "ui", "client"} & tops) and \
+                ({"backend", "api", "server"} & tops):
+            return "tiered_app"
         if "src" in tops and len(tops) < 6:
             return "library"
         return "monolith"
@@ -228,31 +236,59 @@ class RepoLensAgent(BaseAgent):
         return risks
 
     def _extract_deps(self, kf: Dict[str, str]) -> Dict[str, List[str]]:
+        """Aggregate dependencies across ALL manifest copies in the repo.
+
+        key_files stores each fetched file under BOTH its basename and its full
+        path, and the basename key is last-write-wins — so in a monorepo with
+        backend/requirements.txt AND services/x/requirements.txt, the bare
+        `kf["requirements.txt"]` holds only one of them. We instead iterate
+        every key whose basename matches a manifest, so multi-directory deps are
+        all captured, merged, and de-duped (order-preserving)."""
         deps: Dict[str, List[str]] = {}
 
-        if "package.json" in kf:
+        def _contents_for(basename: str) -> List[str]:
+            # Full-path keys only (contain '/'), so we don't double-count the
+            # basename alias of the same file; fall back to the bare key if the
+            # repo is flat (manifest at root has no '/'-keyed entry).
+            paths = [k for k, v in kf.items() if v and Path(k).name == basename and "/" in k]
+            if not paths and basename in kf and kf[basename]:
+                paths = [basename]
+            return [kf[p] for p in paths]
+
+        def _dedup(seq: List[str]) -> List[str]:
+            seen: set = set()
+            return [x for x in seq if x and not (x in seen or seen.add(x))]
+
+        npm: List[str] = []
+        for content in _contents_for("package.json"):
             try:
-                pkg = json.loads(kf["package.json"])
-                all_d = list({**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}.keys())
-                deps["npm"] = all_d[:30]
+                pkg = json.loads(content)
+                npm.extend({**pkg.get("dependencies", {}),
+                            **pkg.get("devDependencies", {})}.keys())
             except Exception:
-                deps["npm"] = []
+                continue
+        if npm:
+            deps["npm"] = _dedup(npm)[:30]
 
-        if "requirements.txt" in kf:
-            lines = [
+        py: List[str] = []
+        for content in _contents_for("requirements.txt") + _contents_for("requirements-dev.txt"):
+            py.extend(
                 ln.strip().split("==")[0].split(">=")[0].split("~=")[0].split("[")[0]
-                for ln in kf["requirements.txt"].splitlines()
+                for ln in content.splitlines()
                 if ln.strip() and not ln.startswith("#")
-            ]
-            deps["python"] = lines[:30]
+            )
+        if py:
+            deps["python"] = _dedup(py)[:30]
 
-        if "go.mod" in kf:
-            lines = [
+        go: List[str] = []
+        for content in _contents_for("go.mod"):
+            go.extend(
                 ln.split()[1]
-                for ln in kf["go.mod"].splitlines()
+                for ln in content.splitlines()
                 if ln.startswith("\t") and " v" in ln
-            ]
-            deps["go"] = lines[:20]
+            )
+        if go:
+            deps["go"] = _dedup(go)[:20]
 
         return deps
 
