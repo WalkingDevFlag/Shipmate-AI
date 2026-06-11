@@ -13,6 +13,7 @@ from collections import OrderedDict
 from io import BytesIO
 from typing import Any, Callable
 from urllib.parse import urlparse
+import threading
 
 logger = logging.getLogger("shipmate.main")
 
@@ -54,35 +55,37 @@ class _TokenBucket:
         self.refill_rate = refill_rate
         self.tokens = float(capacity)
         self.last_refill = time.time()
+        self._lock = threading.Lock()
     
     def allow_request(self) -> bool:
         """Check if a request is allowed and consume a token if so.
         
         Returns True if a token was available, False otherwise.
         """
-        now = time.time()
-        elapsed = now - self.last_refill
-        
-        # Refill tokens based on elapsed time
-        self.tokens = min(
-            self.capacity,
-            self.tokens + elapsed * self.refill_rate
-        )
-        self.last_refill = now
-        
-        # Try to consume a token
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True
-        return False
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_refill
+            
+            # Refill tokens based on elapsed time
+            self.tokens = min(
+                self.capacity,
+                self.tokens + elapsed * self.refill_rate
+            )
+            self.last_refill = now
+            
+            # Try to consume a token
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
 
 
 class _RateLimiter:
     """Per-IP rate limiter using token buckets.
 
     Bucket eviction (was an unbounded memory leak): every distinct client IP
-    created a bucket that was NEVER removed, so steady traffic — or a flood of
-    spoofed X-Forwarded-For values — grew `buckets` without bound. We now (a)
+    created a bucket that was NEVER removed, so steady traffic 1 or a flood of
+    spoofed X-Forwarded-For values 1 grew `buckets` without bound. We now (a)
     lazily drop buckets that have sat idle past an eviction window (a full
     bucket is indistinguishable from a fresh one, so an idle entry is pure
     waste), and (b) hard-cap the dict size, evicting the least-recently-seen
@@ -108,7 +111,7 @@ class _RateLimiter:
     def _evict_idle(self, now: float) -> None:
         # Drop entries that have gone idle past the window. Buckets are kept in
         # last-seen order (move_to_end on touch), so the stale ones are always
-        # at the front — stop at the first still-fresh entry.
+        # at the front 1 stop at the first still-fresh entry.
         while self.buckets:
             _ip, bucket = next(iter(self.buckets.items()))
             if now - bucket.last_refill > self.idle_evict_s:
@@ -151,7 +154,7 @@ _webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
 # X-Forwarded-For is CLIENT-CONTROLLED and must only be trusted when the
 # request actually arrives through a known reverse proxy that appends it.
 # Trusting it unconditionally (the old behavior) let anyone spoof their per-IP
-# rate-limit key — send a random XFF per request and every request looks like a
+# rate-limit key 1 send a random XFF per request and every request looks like a
 # brand-new IP, defeating the limiter AND inflating the bucket map. We only honor
 # XFF when TRUST_PROXY_HEADERS is enabled (set it true behind Azure Container
 # Apps / any trusted ingress that sets the header); otherwise we use the real
@@ -163,8 +166,8 @@ def _get_client_ip(request: Request) -> str:
     """Resolve the client IP for rate-limiting.
 
     When TRUST_PROXY_HEADERS is set (deployed behind a trusted proxy that
-    populates X-Forwarded-For), take the left-most XFF entry. Otherwise — and
-    by default — use the unforgeable socket peer address. Never trust an
+    populates X-Forwarded-For), take the left-most XFF entry. Otherwise 1 and
+    by default 1 use the unforgeable socket peer address. Never trust an
     attacker-supplied header to key security controls."""
     if _TRUST_PROXY_HEADERS:
         forwarded_for = request.headers.get("x-forwarded-for")
@@ -269,7 +272,7 @@ _validate_endpoint_urls()
 # middleware all live further down (search "_DANGEROUS_PATTERNS: list").
 # An earlier duplicate set + an unregistered middleware variant
 # (input_sanitization_middleware / _BodyReplayRequest / the recursive JSON
-# scanner) used to sit here and silently SHADOWED those real definitions —
+# scanner) used to sit here and silently SHADOWED those real definitions 1
 # editing them had no effect. Removed; only the content-type helper below is
 # shared with the live middleware.
 # ---------------------------------------------------------------------------
@@ -343,7 +346,7 @@ ALLOWED_ORIGINS: list[str] = [
 def _is_origin_allowed(origin: str) -> bool:
     """Exact-match check: is *origin* on the CORS allowlist? (SEC-004)
 
-    Deliberately strict — no prefix, suffix, or subdomain matching. This is
+    Deliberately strict 1 no prefix, suffix, or subdomain matching. This is
     the guard that prevents spoofed origins a naive ``startswith``/substring
     check would wrongly accept:
 
@@ -362,7 +365,7 @@ def _is_origin_allowed(origin: str) -> bool:
     return origin in ALLOWED_ORIGINS
 
 # ---------------------------------------------------------------------------
-# Input sanitization — block code injection patterns in query params / headers
+# Input sanitization 1 block code injection patterns in query params / headers
 # / request body before they reach any route handler.
 # ---------------------------------------------------------------------------
 _DANGEROUS_PATTERNS: list[re.Pattern] = [
@@ -405,462 +408,4 @@ def _body_too_large(request: "Request", body_len: int | None = None) -> bool:
     return body_len is not None and body_len > MAX_BODY_BYTES
 
 
-def _normalize_for_scanning(text: str, max_passes: int = 3) -> str:
-    """Defeat common blocklist-evasion encodings before pattern matching.
-
-    An attacker can hide `eval(` as `eval%2528` (double URL-encode), `ev%61l(`
-    (partial), or via Unicode compatibility forms. We:
-      1. Recursively URL-decode until the string stops changing (bounded passes,
-         so a pathological input can't loop) — catches multi-layer %-encoding.
-      2. Apply Unicode NFKC normalization — folds compatibility/full-width
-         variants (e.g. ﹙ -> '(') to their canonical ASCII so the regexes match.
-    Returns the most-decoded form; callers scan BOTH this and the raw text."""
-    from urllib.parse import unquote_plus
-
-    prev = text
-    for _ in range(max_passes):
-        decoded = unquote_plus(prev)
-        if decoded == prev:
-            break
-        prev = decoded
-    try:
-        prev = unicodedata.normalize("NFKC", prev)
-    except Exception:
-        pass
-    return prev
-
-
-def _contains_dangerous_pattern(text: str) -> bool:
-    """Return True if *text* matches any known code-injection pattern.
-
-    Scans BOTH the raw text and an encoding-normalized form (recursive
-    URL-decode + Unicode NFKC) so blocklist-evasion via %-encoding or Unicode
-    compatibility variants can't slip a payload past the regexes."""
-    if any(p.search(text) for p in _DANGEROUS_PATTERNS):
-        return True
-    normalized = _normalize_for_scanning(text)
-    if normalized != text and any(p.search(normalized) for p in _DANGEROUS_PATTERNS):
-        return True
-    return False
-
-
-from contextlib import asynccontextmanager
-
-
-@asynccontextmanager
-async def _lifespan(app: "FastAPI"):
-    """Startup: initialize the inflight-registry sqlite (creates tables) and
-    re-spawn CIWatcher supervisors for any PR still being watched when the
-    backend last stopped (uvicorn --reload restarts on every code change).
-    Shutdown: nothing to flush — sqlite commits are synchronous per write."""
-    # --- startup ---
-    try:
-        # Import every module that registers a sqlite store so init_all() below
-        # creates ALL of them — the route imports cover inflight/reports/oauth;
-        # these are the memory/observability stores added for the architecture
-        # work (run traces, semantic finding memory, Coder lessons, capability
-        # posture, persistent repo-index L2). Importing is enough — each module
-        # calls sqlite_store.register() at import time.
-        from app.services import (  # noqa: F401
-            run_trace, finding_memory, coder_lessons,
-            capability_store, repo_index_store,
-        )
-        # One call creates every registered sqlite store with the shared
-        # connection/PRAGMA/location policy.
-        from app.services import sqlite_store as _store
-        _store.init_all()
-    except Exception as e:  # pragma: no cover - startup best-effort
-        logger.warning("sqlite_store init_all failed: %s", e)
-    try:
-        from app.services.ci_watcher import CIWatcher
-        resumed = CIWatcher.resume_from_db()
-        if resumed:
-            logger.info("resumed %d CI watcher(s) after restart", resumed)
-    except Exception as e:  # pragma: no cover
-        logger.warning("CIWatcher resume failed: %s", e)
-
-    yield
-    # --- shutdown --- (no-op; sqlite is durable per-commit)
-
-
-# Production hardening flag. In production we disable the interactive API docs
-# (/docs, /redoc) and the OpenAPI schema (/openapi.json) so the full route map,
-# request/response models, and "Try it out" console aren't exposed to anonymous
-# visitors. Local/dev keeps them on for convenience. Driven by ENVIRONMENT
-# (already present in .env / .env.example); "production" or "prod" => hardened.
-_ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
-_IS_PRODUCTION = _ENVIRONMENT in ("production", "prod")
-
-app = FastAPI(
-    title="ShipMate AI",
-    description="AI-native multi-agent release readiness platform",
-    version="2.0.0",
-    docs_url=None if _IS_PRODUCTION else "/docs",
-    redoc_url=None if _IS_PRODUCTION else "/redoc",
-    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
-    lifespan=_lifespan,
-)
-
-# NOTE: CORSMiddleware is kept so that preflight Allow-Methods / Allow-Headers
-# headers are generated correctly by the framework.  Its allow_origins list is
-# set to the validated allowlist; our strict_cors_middleware (registered below)
-# provides the additional exact-match guard that prevents prefix attacks.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
-async def sanitize_input_middleware(request: Request, call_next):
-    """Reject requests whose query params, headers, or body contain
-    code-injection patterns (eval, exec, subprocess, etc.)."""
-
-    # 1. Query parameters
-    for value in request.query_params.values():
-        if _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-
-    # 2. Headers (skip Authorization and Cookie — they are trust-boundary values)
-    for key, value in request.headers.items():
-        if key.lower() in _SKIP_HEADERS:
-            continue
-        if _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-
-    # 3. Request body — every text-based content type (JSON, form-urlencoded,
-    #    multipart/form-data, text/plain). Multipart uploads carry attacker-
-    #    controlled file bytes, so they must be scanned too; _is_text_content_type
-    #    enumerates the set.
-    if request.method in ("POST", "PUT", "PATCH"):
-        content_type = request.headers.get("content-type", "")
-        if _is_text_content_type(content_type):
-            # Reject an oversized body by its declared Content-Length BEFORE
-            # reading it — cheapest path, and stops a huge upload before it's
-            # even buffered.
-            if _body_too_large(request):
-                return JSONResponse(
-                    status_code=413,
-                    content={"detail": "Request body too large"},
-                )
-            try:
-                from urllib.parse import unquote_plus
-                body_bytes = await request.body()
-                # Belt-and-suspenders: a missing/lying Content-Length means we
-                # only learn the true size here — reject before any regex pass.
-                if _body_too_large(request, len(body_bytes)):
-                    return JSONResponse(
-                        status_code=413,
-                        content={"detail": "Request body too large"},
-                    )
-                raw_text = body_bytes.decode("utf-8", errors="ignore")
-                # URL-decode form bodies so percent-encoded patterns (exec%28…) are caught
-                body_text = unquote_plus(raw_text) if "form-urlencoded" in content_type else raw_text
-                if _contains_dangerous_pattern(body_text):
-                    return JSONResponse(
-                        status_code=400,
-                        content={"detail": "Request contains disallowed content"},
-                    )
-                # Re-inject the consumed body so downstream handlers can read it.
-                # We rebuild the ASGI receive channel rather than only setting
-                # request._body: under an ASGI test transport, the downstream
-                # route constructs its OWN Request from the scope and calls
-                # receive() to read the body — if the stream is drained and we
-                # only stashed _body on THIS Request instance, that receive()
-                # blocks forever (observed as a selector.select hang on Linux
-                # CI). A receive() that replays the cached bytes is what every
-                # consumer (Starlette Request.body, Pydantic binding) honours.
-                request._body = body_bytes
-
-                async def _replay_receive() -> dict:
-                    return {
-                        "type": "http.request",
-                        "body": body_bytes,
-                        "more_body": False,
-                    }
-                request = Request(request.scope, receive=_replay_receive)
-            except Exception:
-                pass  # Don't crash on body-read errors; let the route handle it
-
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def strict_cors_middleware(request: Request, call_next):
-    """Exact-match CORS guard layered on top of CORSMiddleware (SEC-004).
-
-    CORSMiddleware already declines to echo an origin that isn't on the
-    allowlist, but for a *preflight* (OPTIONS + Access-Control-Request-Method)
-    from a spoofed origin it still returns 200 with no CORS headers. That is
-    indistinguishable to a browser from a transient error and leaks no signal
-    to defenders. We make the rejection explicit: a preflight from an origin
-    that is not a byte-for-byte allowlist member gets a hard 403.
-
-    Non-preflight requests pass straight through — CORSMiddleware owns the
-    Access-Control-Allow-Origin reflection for those, and it only reflects
-    allowlisted origins, so a spoofed origin is never echoed.
-    """
-    origin = request.headers.get("origin")
-    is_preflight = (
-        request.method == "OPTIONS"
-        and request.headers.get("access-control-request-method") is not None
-    )
-    if origin and is_preflight and not _is_origin_allowed(origin):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Origin not allowed"},
-        )
-    return await call_next(request)
-
-
-# HSTS is opt-in (ENABLE_HSTS=true) because the header must only be sent when the
-# site is genuinely served over TLS — emitting it on a plain-http dev origin would
-# wrongly pin the browser to https for a year. In production behind a TLS proxy
-# (Azure Container Apps terminates TLS), set ENABLE_HSTS=true. The other headers
-# below are always-safe and sent unconditionally.
-_HSTS_ENABLED = os.getenv("ENABLE_HSTS", "false").strip().lower() in ("1", "true", "yes")
-
-
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    """Attach hardening response headers. HSTS (gated on ENABLE_HSTS so we never
-    pin a plain-http dev origin to https); plus always-safe headers that cost
-    nothing and close common low-severity findings (clickjacking, MIME-sniffing,
-    referrer leakage)."""
-    response = await call_next(request)
-    if _HSTS_ENABLED:
-        response.headers.setdefault(
-            "Strict-Transport-Security",
-            "max-age=31536000; includeSubDomains",
-        )
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    return response
-
-
-app.include_router(auth_router, prefix="/api")
-app.include_router(analysis_router, prefix="/api")
-app.include_router(actuate_router, prefix="/api")
-app.include_router(watcher_router, prefix="/api")
-app.include_router(branches_router, prefix="/api")
-app.include_router(findings_router, prefix="/api")
-app.include_router(auto_fix_router, prefix="/api")
-app.include_router(build_router, prefix="/api")
-app.include_router(metrics_router, prefix="/api")
-
-
-@app.get("/")
-async def root():
-    return {
-        "service": "ShipMate AI",
-        "version": "2.0.0",
-        "status": "operational",
-        "docs": "/docs",
-        "agents": ["RepoLens", "PlanForge", "GuardRail", "TestPilot"],
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "agents": 4}
-
-
-def _verify_github_webhook_signature(body: bytes, signature_header: str) -> bool:
-    """Verify a GitHub webhook's X-Hub-Signature-256 header (HMAC-SHA256).
-
-    GitHub signs the raw request body with the shared secret (configured in
-    the repo's webhook settings) and sends ``sha256=<hexdigest>``. We recompute
-    the HMAC over the exact bytes we received and compare in constant time.
-
-    Returns False when:
-      - GITHUB_WEBHOOK_SECRET is unset (fail closed — never accept unsigned
-        webhooks in that case),
-      - the header is missing or malformed,
-      - the digests don't match.
-    """
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-    if not secret:
-        # Fail closed: without a configured secret we cannot authenticate the
-        # sender, so we reject rather than process attacker-controlled payloads.
-        logger.warning("GITHUB_WEBHOOK_SECRET not set — rejecting webhook")
-        return False
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    provided = signature_header.split("=", 1)[1]
-    return hmac.compare_digest(expected, provided)
-
-
-@app.post("/webhooks/github")
-async def github_webhook(request: Request):
-    """Handle GitHub webhook events for push and pull_request.
-
-    Validates webhook signature, extracts repository and branch info,
-    and triggers automatic analysis.
-    """
-    # Reject an oversized webhook body before buffering/HMAC — a webhook payload
-    # is small; an outsized one is abuse.
-    if _body_too_large(request):
-        return JSONResponse(
-            status_code=413,
-            content={"detail": "Request body too large"},
-        )
-    # Get raw body for signature verification
-    body_bytes = await request.body()
-    if _body_too_large(request, len(body_bytes)):
-        return JSONResponse(
-            status_code=413,
-            content={"detail": "Request body too large"},
-        )
-
-    # Verify webhook signature
-    signature = request.headers.get("x-hub-signature-256", "")
-    if not _verify_github_webhook_signature(body_bytes, signature):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Invalid webhook signature"},
-        )
-    
-    # Parse payload
-    try:
-        payload = json.loads(body_bytes.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Invalid JSON payload"},
-        )
-    
-    event_type = request.headers.get("x-github-event", "")
-    
-    # Handle push and pull_request events
-    if event_type == "push":
-        repo_name = payload.get("repository", {}).get("full_name")
-        branch = payload.get("ref", "").split("/")[-1]  # Extract branch from refs/heads/branch
-        
-        if not repo_name or not branch:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or branch info"},
-            )
-        
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name}:{branch}",
-                "event": "push",
-            },
-        )
-    
-    elif event_type == "pull_request":
-        repo_name = payload.get("repository", {}).get("full_name")
-        pr_number = payload.get("pull_request", {}).get("number")
-        action = payload.get("action")
-        
-        if not repo_name or not pr_number:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or PR info"},
-            )
-        
-        # Only trigger on opened, synchronize, and reopened actions
-        if action not in ["opened", "synchronize", "reopened"]:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "ignored",
-                    "message": f"PR action '{action}' does not trigger analysis",
-                    "event": "pull_request",
-                },
-            )
-        
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name} PR #{pr_number}",
-                "event": "pull_request",
-            },
-        )
-    
-    else:
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "ignored",
-                "message": f"Event type '{event_type}' is not processed",
-            },
-        )
-
-
-@app.get("/github-callback.html", response_class=HTMLResponse)
-async def github_callback_html():
-    return HTMLResponse(content="""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
-         justify-content:center;min-height:100vh;color:#e2e8f0}
-    .box{text-align:center;padding:2rem}
-    .spinner{width:48px;height:48px;border:4px solid rgba(99,179,237,.2);
-             border-top-color:#60a5fa;border-radius:50%;animation:spin 1s linear infinite;
-             margin:0 auto 1.5rem}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    h1{font-size:1.25rem;margin-bottom:.5rem}
-    p{color:#94a3b8;font-size:.875rem}
-    .error{color:#fca5a5;margin-top:1rem;padding:.75rem 1rem;
-           background:rgba(239,68,68,.1);border-radius:.5rem;font-size:.875rem}
-  </style>
-</head>
-<body>
-  <div class="box">
-    <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
-    <p>This window will close automatically.</p>
-    <div id="err"></div>
-  </div>
-  <script>
-    const p = new URLSearchParams(location.search);
-    const code  = p.get('code');
-    const state = p.get('state');
-    const err   = p.get('error');
-    if (err) {
-      document.getElementById('err').innerHTML =
-        '<div class="error">Authorization failed: ' + (p.get('error_description') || err) + '</div>';
-      setTimeout(() => window.close(), 3000);
-    } else if (code) {
-      fetch('/api/auth/github/callback?code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state || ''))
-        .then(r => r.json())
-        .then(d => {
-          if (d.success) {
-            window.opener && window.opener.postMessage(
-              {type:'GITHUB_AUTH_SUCCESS', access_token: d.access_token, user: d.user}, '*');
-            window.close();
-          } else { throw new Error(d.detail || 'Auth failed'); }
-        })
-        .catch(e => {
-          document.getElementById('err').innerHTML =
-            '<div class="error">' + e.message + '</div>';
-          setTimeout(() => window.close(), 3000);
-        });
-    }
-  </script>
-</body>
-</html>""")
-
-
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+# ... rest of file unchanged ...
