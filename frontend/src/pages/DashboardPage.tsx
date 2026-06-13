@@ -37,7 +37,7 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
   return (
     <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: 0 }}>
       <RadarBg sweep rings blobs={false} style={{ opacity: 0.35 }} />
-      <div style={{ position: 'relative', display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 32, padding: 28, alignItems: 'center' }}>
+      <div className="score-grid" style={{ position: 'relative', display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 32, padding: 28, alignItems: 'center' }}>
         {/* Score ring */}
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, paddingRight: 28, borderRight: '1px solid var(--line)' }}>
           <div className="eyebrow">Deployment Readiness</div>
@@ -75,7 +75,7 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
           </div>
 
           {/* Score breakdown bars */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
+          <div className="stat-grid-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
             {breakdown.map(b => {
               const agent = AGENTS.find(a => a.key === b.key);
               if (!agent) return null;
@@ -249,7 +249,7 @@ export function DashboardPage({ user, repos, report, onNavigate, onAnalyze }: Pr
   const name = user?.name?.split(' ')[0] || user?.login || 'Developer';
 
   return (
-    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
+    <motion.div className="page-content" initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
       style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>

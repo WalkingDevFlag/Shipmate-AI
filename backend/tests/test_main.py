@@ -75,23 +75,15 @@ class TestRouteRegistration:
         assert data["status"] == "healthy"
         assert data["agents"] == 4
 
-    def test_github_callback_html_endpoint_exists(self):
-        """Verify GitHub callback HTML endpoint is registered."""
-        response = client.get("/github-callback.html")
-        assert response.status_code == 200
+    def test_stale_github_callback_html_removed(self):
+        """The server-served /github-callback.html is gone.
 
-    def test_github_callback_html_response_type(self):
-        """Verify GitHub callback endpoint returns HTML."""
+        It was a dead OAuth fallback that posted `d.access_token` — undefined
+        since the session-vault migration (the callback now returns an opaque
+        session_id, never the raw token). The SPA popup path (GitHubCallback.tsx
+        at the /github/callback SPA route) is the only OAuth completion path."""
         response = client.get("/github-callback.html")
-        assert "text/html" in response.headers["content-type"]
-
-    def test_github_callback_html_content(self):
-        """Verify GitHub callback HTML contains expected elements."""
-        response = client.get("/github-callback.html")
-        content = response.text
-        assert "<!DOCTYPE html>" in content
-        assert "GitHub authorization" in content
-        assert "spinner" in content
+        assert response.status_code == 404
 
     def test_auth_router_prefix(self):
         """Verify auth router is registered with /api prefix."""

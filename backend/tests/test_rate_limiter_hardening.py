@@ -59,6 +59,74 @@ class TestRateLimiterEviction:
         assert rl.is_allowed("x") is False   # burst exhausted, no refill
 
 
+# ── Retry-After hint ─────────────────────────────────────────────────────────
+
+class TestRetryAfter:
+    def test_retry_after_when_exhausted(self):
+        from app.main import _RateLimiter
+        rl = _RateLimiter(capacity=1, refill_rate=0.5, max_buckets=10, idle_evict_s=9999)
+        assert rl.is_allowed("x") is True     # consume the only token
+        assert rl.is_allowed("x") is False    # exhausted
+        # Refill is 0.5 tok/s → ~2s to the next token; ceil, floored at 1.
+        assert rl.retry_after_seconds() == 2
+
+    def test_retry_after_never_zero(self):
+        from app.main import _RateLimiter
+        rl = _RateLimiter(capacity=5, refill_rate=10.0, max_buckets=10, idle_evict_s=9999)
+        rl.is_allowed("x")
+        assert rl.retry_after_seconds() >= 1   # always a positive backoff
+
+
+# ── Middleware is actually MOUNTED (the dead-code regression guard) ──────────
+# The three rate_limit_* functions used to be defined but never registered, so
+# per-IP limiting silently never ran. These tests pin the live behaviour: a
+# burst past capacity returns 429 + Retry-After on the real endpoint paths.
+
+class TestRateLimitMiddlewareMounted:
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        return TestClient(app)
+
+    def test_path_router_matches_real_endpoints(self):
+        # The analysis bucket must cover the REAL path (/api/analyze[/stream]),
+        # not the old wrong /api/analysis prefix the dead code checked.
+        from app.main import _limiter_for_path, _analysis_limiter, _auth_limiter, _webhook_limiter
+        assert _limiter_for_path("/api/analyze")[0] is _analysis_limiter
+        assert _limiter_for_path("/api/analyze/stream")[0] is _analysis_limiter
+        assert _limiter_for_path("/api/auth/github/callback")[0] is _auth_limiter
+        assert _limiter_for_path("/webhooks/github")[0] is _webhook_limiter
+        assert _limiter_for_path("/api/build/plan")[0] is None   # unguarded path
+
+    def test_middleware_function_exists(self):
+        # Regression guard: the rate-limit middleware must exist as a registered
+        # @app.middleware function (it was previously defined but never mounted).
+        import app.main as m
+        assert hasattr(m, "rate_limit_middleware"), "rate_limit_middleware must exist"
+        # And the three standalone unregistered functions must be GONE.
+        assert not hasattr(m, "rate_limit_auth_middleware"), \
+            "the old unregistered rate_limit_auth_middleware must be removed"
+
+    def test_auth_callback_bursts_to_429_with_retry_after(self, monkeypatch):
+        # auth limiter is capacity=2; the 3rd rapid hit from the same IP → 429.
+        import app.main as m
+        # The suite disables the limiter (SHIPMATE_RATE_LIMIT=0 in conftest); flip
+        # it back ON for this test so we exercise the real 429 path end-to-end.
+        monkeypatch.setenv("SHIPMATE_RATE_LIMIT", "1")
+        # Make the limiter deterministic: no refill within the test window.
+        m._auth_limiter.buckets.clear()
+        monkeypatch.setattr(m._auth_limiter, "refill_rate", 0.0)
+        client = self._client()
+        # The callback needs ?code/&state; a missing-arg request still passes
+        # THROUGH the limiter first (middleware runs before routing/validation).
+        seen = [client.get("/api/auth/github/callback").status_code for _ in range(4)]
+        assert 429 in seen, f"limiter never tripped: {seen}"
+        # Confirm the 429 carries a Retry-After header.
+        last = client.get("/api/auth/github/callback")
+        assert last.status_code == 429
+        assert int(last.headers.get("Retry-After", "0")) >= 1
+
+
 # ── X-Forwarded-For trust gate ───────────────────────────────────────────────
 
 class _FakeReq:

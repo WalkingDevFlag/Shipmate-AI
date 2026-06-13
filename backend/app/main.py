@@ -5,20 +5,21 @@ import os
 import re
 import json
 import time
+import math
 import hmac
 import hashlib
 import logging
 import unicodedata
 from collections import OrderedDict
 from io import BytesIO
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger("shipmate.main")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 from app.api.routes.auth import router as auth_router
@@ -76,6 +77,17 @@ class _TokenBucket:
             self.tokens -= 1.0
             return True
         return False
+
+    def retry_after_seconds(self) -> int:
+        """Whole seconds until the next token is available (for Retry-After).
+
+        Assumes a refill just happened (allow_request() updates self.tokens),
+        so this reflects the wait from now. Always >= 1 so a client never
+        retries instantly into another 429."""
+        if self.refill_rate <= 0:
+            return 1
+        deficit = max(0.0, 1.0 - self.tokens)
+        return max(1, math.ceil(deficit / self.refill_rate))
 
 
 class _RateLimiter:
@@ -135,7 +147,14 @@ class _RateLimiter:
         else:
             # Mark as most-recently-used.
             self.buckets.move_to_end(client_ip)
+        self._last_checked = bucket
         return bucket.allow_request()
+
+    def retry_after_seconds(self) -> int:
+        """Retry-After hint (seconds) for the bucket touched by the most recent
+        is_allowed() call. Falls back to a 1s floor if nothing was checked yet."""
+        bucket = getattr(self, "_last_checked", None)
+        return bucket.retry_after_seconds() if bucket is not None else 1
 
 
 # Rate limiters for sensitive endpoints
@@ -179,40 +198,25 @@ def _get_client_ip(request: Request) -> str:
     return "unknown"
 
 
-async def rate_limit_auth_middleware(request: Request, call_next: Callable):
-    """Rate limit the /auth/callback endpoint."""
-    if request.url.path == "/api/auth/github/callback":
-        client_ip = _get_client_ip(request)
-        if not _auth_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many authentication attempts."},
-            )
-    return await call_next(request)
+# Map a request path to the limiter that guards it. A path matches when it
+# equals an entry or starts with it + "/" (so /api/analyze AND /api/analyze/stream
+# both fall under the analysis bucket). Ordered most-specific-first; first match
+# wins. NOTE: these limiters are mounted via @app.middleware below — earlier they
+# were defined but never registered, so per-IP limiting silently never ran.
+_RATE_LIMIT_ROUTES: tuple = (
+    ("/api/auth/github/callback", lambda: _auth_limiter, "Too many authentication attempts."),
+    ("/api/analyze",              lambda: _analysis_limiter, "Too many analysis requests."),
+    ("/webhooks/github",          lambda: _webhook_limiter, "Too many webhook requests."),
+)
 
 
-async def rate_limit_analysis_middleware(request: Request, call_next: Callable):
-    """Rate limit the /analysis endpoint."""
-    if request.url.path.startswith("/api/analysis"):
-        client_ip = _get_client_ip(request)
-        if not _analysis_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many analysis requests."},
-            )
-    return await call_next(request)
-
-
-async def rate_limit_webhook_middleware(request: Request, call_next: Callable):
-    """Rate limit the /webhooks/github endpoint."""
-    if request.url.path == "/webhooks/github":
-        client_ip = _get_client_ip(request)
-        if not _webhook_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many webhook requests."},
-            )
-    return await call_next(request)
+def _limiter_for_path(path: str):
+    """Return (limiter, message) for the first route prefix that guards `path`,
+    or (None, None) when the path isn't rate-limited."""
+    for prefix, limiter_fn, message in _RATE_LIMIT_ROUTES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return limiter_fn(), message
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +653,33 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# Kill-switch for the limiter. Defaults ON. The test suite sets this to "0" so
+# the many TestClient calls (all sharing the loopback IP) don't accumulate into
+# a spurious 429 — limiter BEHAVIOUR is covered directly in
+# test_rate_limiter_hardening.py, which flips it back on for its assertions.
+def _rate_limit_enabled() -> bool:
+    return os.getenv("SHIPMATE_RATE_LIMIT", "1").strip().lower() not in ("0", "false", "no")
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Per-IP token-bucket rate limiting for the sensitive endpoints (auth
+    callback, analyze, webhook). Registered LAST so it's the OUTERMOST layer —
+    an over-limit request is rejected with 429 + Retry-After before any body
+    sanitization or routing work happens. The IP is resolved via _get_client_ip
+    (socket peer unless TRUST_PROXY_HEADERS), so the key can't be spoofed."""
+    if _rate_limit_enabled():
+        limiter, message = _limiter_for_path(request.url.path)
+        if limiter is not None and not limiter.is_allowed(_get_client_ip(request)):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"Rate limit exceeded. {message}"},
+                # Standards-compliant backoff hint so clients don't retry-storm.
+                headers={"Retry-After": str(limiter.retry_after_seconds())},
+            )
+    return await call_next(request)
+
+
 app.include_router(auth_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 app.include_router(actuate_router, prefix="/api")
@@ -803,65 +834,6 @@ async def github_webhook(request: Request):
                 "message": f"Event type '{event_type}' is not processed",
             },
         )
-
-
-@app.get("/github-callback.html", response_class=HTMLResponse)
-async def github_callback_html():
-    return HTMLResponse(content="""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
-         justify-content:center;min-height:100vh;color:#e2e8f0}
-    .box{text-align:center;padding:2rem}
-    .spinner{width:48px;height:48px;border:4px solid rgba(99,179,237,.2);
-             border-top-color:#60a5fa;border-radius:50%;animation:spin 1s linear infinite;
-             margin:0 auto 1.5rem}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    h1{font-size:1.25rem;margin-bottom:.5rem}
-    p{color:#94a3b8;font-size:.875rem}
-    .error{color:#fca5a5;margin-top:1rem;padding:.75rem 1rem;
-           background:rgba(239,68,68,.1);border-radius:.5rem;font-size:.875rem}
-  </style>
-</head>
-<body>
-  <div class="box">
-    <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
-    <p>This window will close automatically.</p>
-    <div id="err"></div>
-  </div>
-  <script>
-    const p = new URLSearchParams(location.search);
-    const code  = p.get('code');
-    const state = p.get('state');
-    const err   = p.get('error');
-    if (err) {
-      document.getElementById('err').innerHTML =
-        '<div class="error">Authorization failed: ' + (p.get('error_description') || err) + '</div>';
-      setTimeout(() => window.close(), 3000);
-    } else if (code) {
-      fetch('/api/auth/github/callback?code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state || ''))
-        .then(r => r.json())
-        .then(d => {
-          if (d.success) {
-            window.opener && window.opener.postMessage(
-              {type:'GITHUB_AUTH_SUCCESS', access_token: d.access_token, user: d.user}, '*');
-            window.close();
-          } else { throw new Error(d.detail || 'Auth failed'); }
-        })
-        .catch(e => {
-          document.getElementById('err').innerHTML =
-            '<div class="error">' + e.message + '</div>';
-          setTimeout(() => window.close(), 3000);
-        });
-    }
-  </script>
-</body>
-</html>""")
 
 
 if __name__ == "__main__":
