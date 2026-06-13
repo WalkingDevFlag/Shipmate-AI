@@ -133,9 +133,9 @@ def _print_plan(plan: BuildPlanResponse, show_ungrounded: bool) -> None:
     if not plan.opportunities:
         print("\n  (no opportunities returned)")
         if not plan.ai_enhanced:
-            print("  → LLM provider unavailable. Refresh ADA creds + retry:")
-            print("    ada credentials update --account=788356290950 "
-                  "--role=IibsAdminAccess-DO-NOT-DELETE --provider=conduit --once")
+            print("  → LLM provider unavailable. Check the Azure OpenAI "
+                  "credentials (AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY) "
+                  "and retry.")
         return
 
     for o in plan.opportunities:

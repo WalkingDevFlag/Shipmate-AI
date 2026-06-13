@@ -112,9 +112,9 @@ def _maybe_invalidate_provider(err: BaseException) -> None:
     if any(m in msg for m in _TRANSIENT_AUTH_MARKERS):
         logger.warning(
             "LLMService: detected transient auth failure (%s) — invalidating "
-            "provider cache. Next request will rebuild boto3 with fresh "
-            "credentials. If you just ran `ada credentials update`, the next "
-            "analyze call should succeed.",
+            "provider cache. The next request rebuilds the LLM client with "
+            "freshly-resolved credentials, so a refreshed key/token takes "
+            "effect without a restart.",
             type(err).__name__,
         )
         # Reset under the same lock _get_provider uses, so an invalidation can't

@@ -15,10 +15,10 @@ Why Converse + toolConfig (vs InvokeModel + per-model body):
   • boto3-only — no extra deps. The SDK is sync; we wrap calls with
     `asyncio.to_thread` exactly like AzureOpenAIProvider does.
 
-Auth: relies on the standard boto3 credential provider chain. On the
-Pharma-ASIN-Enrich-9 burner account, `ada credentials update` populates
-the default profile at ~/.aws/credentials and boto3 picks it up
-transparently — no AWS_PROFILE env var needed.
+Auth: relies on the standard boto3 credential provider chain — environment
+variables, the shared config file at ~/.aws/credentials, or an instance/role
+profile. boto3 resolves whichever is present transparently; no AWS_PROFILE
+env var is required.
 """
 from __future__ import annotations
 

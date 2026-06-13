@@ -25,12 +25,15 @@ class ArchitectureRisk(BaseModel):
     risk: str
     impact: str   # "critical" | "high" | "medium" | "low"
     category: str  # "structure" | "deps" | "config" | "ci_cd" | "security" | "docs"
+    evidence: Optional[str] = None   # file path or pattern that grounds this risk
+    confidence: str = "high"         # "high" | "medium" | "low"
 
 
 class RepoLensOutput(BaseModel):
     tech_stack: List[str]
     primary_language: str
-    architecture_pattern: str   # "monolith" | "monorepo" | "microservices" | "library" | "unknown"
+    # "monolith" | "monorepo" | "microservices" | "fullstack" | "frontend" | "backend" | "library" | "unknown"
+    architecture_pattern: str
     key_modules: List[str]
     entry_points: List[str]
     config_files: List[str]

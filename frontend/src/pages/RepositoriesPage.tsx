@@ -41,7 +41,7 @@ export function RepositoriesPage({ repos, loadingRepos, selectedRepo, analyzing,
 
   if (!loadingRepos && repos.length === 0) {
     return (
-      <div style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
+      <div className="page-content" style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
         <EmptyState onConnect={onConnect} />
       </div>
     );
@@ -62,7 +62,7 @@ export function RepositoriesPage({ repos, loadingRepos, selectedRepo, analyzing,
   });
 
   return (
-    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
+    <motion.div className="page-content" initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
       style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>

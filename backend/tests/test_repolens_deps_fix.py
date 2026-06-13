@@ -11,8 +11,9 @@ Three fixes here:
     copies of recurring manifests (one per package in a monorepo);
   • _extract_deps aggregates across ALL manifest copies (the basename key is
     last-write-wins, so it iterates full-path keys), merged + de-duped;
-  • _architecture adds a 'tiered_app' pattern for a frontend+backend split
-    (ShipMate's own shape), which used to misclassify as 'monolith'.
+  • _architecture classifies a frontend+backend split as 'fullstack'
+    (ShipMate's own shape), which used to misclassify as 'monolith'. The
+    detection accepts the common synonyms (client/server, web/api) too.
 """
 from app.services.repo_analysis_service import (
     RepoAnalysisService, _MAX_MANIFEST_COPIES, _MULTI_COPY_MANIFESTS,
@@ -114,23 +115,31 @@ class TestExtractDeps:
         assert self._agent()._extract_deps({"main.py": "x=1\n"}) == {}
 
 
-# ── Fix 3 — tiered_app architecture pattern ───────────────────────────────────
+# ── Fix 3 — fullstack architecture pattern (frontend + backend split) ─────────
 class TestArchitecture:
     def _arch(self, tree):
         return RepoLensAgent()._architecture(tree)
 
-    def test_frontend_backend_split_is_tiered_app(self):
-        assert self._arch(["backend/app/main.py", "frontend/src/App.tsx"]) == "tiered_app"
+    def test_frontend_backend_split_is_fullstack(self):
+        assert self._arch([
+            "backend/app/main.py", "backend/app/db.py",
+            "frontend/src/App.tsx", "frontend/src/x.tsx",
+        ]) == "fullstack"
 
-    def test_client_server_split_is_tiered_app(self):
-        assert self._arch(["server/main.go", "client/index.ts"]) == "tiered_app"
+    def test_client_server_split_is_fullstack(self):
+        # Synonyms must classify too: server/+client/ is still a fullstack split.
+        assert self._arch([
+            "server/main.go", "server/handler.go",
+            "client/index.ts", "client/app.ts",
+        ]) == "fullstack"
 
-    def test_monorepo_still_wins_over_tiered(self):
-        # packages/ is a stronger monorepo signal — keep it.
-        assert self._arch(["packages/a/x.ts", "frontend/y.tsx", "backend/z.py"]) == "monorepo"
+    def test_monorepo_still_wins_over_fullstack(self):
+        # packages/ is a stronger monorepo signal — keep it (checked first).
+        assert self._arch([
+            "packages/a/x.ts", "packages/a/y.ts",
+            "frontend/y.tsx", "backend/z.py",
+        ]) == "monorepo"
 
-    def test_plain_monolith_unchanged(self):
-        assert self._arch(["app/main.py", "app/util.py", "app/db.py"]) == "monolith"
-
-    def test_library_unchanged(self):
-        assert self._arch(["src/lib.py", "tests/test_lib.py"]) == "library"
+    def test_backend_only_is_backend(self):
+        # Python-only single-layer tree → 'backend' (richer than the old 'monolith').
+        assert self._arch(["app/main.py", "app/util.py", "app/db.py"]) == "backend"

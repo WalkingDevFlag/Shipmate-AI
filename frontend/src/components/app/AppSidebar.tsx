@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
-import { LayoutDashboard, FolderGit2, Activity, FileBarChart2, Hammer, LogOut, ChevronDown, Check, Lock, BookOpen } from 'lucide-react';
+import { LayoutDashboard, FolderGit2, Activity, FileBarChart2, Hammer, LogOut, ChevronDown, Check, Lock, BookOpen, X, Sparkles, Bell, Zap } from 'lucide-react';
 import { Wordmark } from '../ui/LogoMark';
 import { GitHubIcon } from '../ui/GitHubIcon';
+import { BranchPicker } from '../ui/BranchPicker';
 import { LANG_COLORS } from '../../lib/agents';
 import type { GitHubUser, GitHubRepo } from '../../types';
 
@@ -84,21 +85,58 @@ interface AppSidebarProps {
   selectedRepo?: GitHubRepo | null;
   onSelectRepo?: (r: GitHubRepo) => void;
   hasReport?: boolean;
+  // Mobile drawer
+  mobileOpen?: boolean;
+  onMobileClose?: () => void;
+  isMobile?: boolean;
+  // Mobile: also expose branch picker + actions inside the drawer
+  selectedBranch?: string;
+  onBranchChange?: (b: string) => void;
+  accessToken?: string | null;
+  analyzing?: boolean;
+  onAnalyze?: () => void;
+  onAutoFix?: () => void;
 }
 
-export function AppSidebar({ activePage, onNavigate, user, onLogout, repos = [], selectedRepo = null, onSelectRepo, hasReport = false }: AppSidebarProps) {
+export function AppSidebar({
+  activePage, onNavigate, user, onLogout,
+  repos = [], selectedRepo = null, onSelectRepo, hasReport = false,
+  mobileOpen = false, onMobileClose, isMobile = false,
+  selectedBranch, onBranchChange, accessToken,
+  analyzing = false, onAnalyze, onAutoFix,
+}: AppSidebarProps) {
   const initials = user ? (user.name ?? user.login).split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase() : 'U';
 
+  // On mobile the sidebar is a fixed slide-in drawer (off-canvas by default);
+  // on desktop it's the sticky 248px column.
+  const sidebarStyle: React.CSSProperties = isMobile ? {
+    position: 'fixed', left: 0, top: 0, width: 280, height: '100vh', zIndex: 100,
+    transform: mobileOpen ? 'translateX(0)' : 'translateX(-100%)',
+    transition: 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+    background: 'linear-gradient(180deg, var(--sidebar-top), var(--sidebar-bot))',
+    borderRight: '1px solid var(--line)', display: 'flex', flexDirection: 'column', padding: 16,
+    overflowY: 'auto',
+  } : {
+    width: 248, flexShrink: 0, height: '100vh', position: 'sticky', top: 0,
+    background: 'linear-gradient(180deg, var(--sidebar-top), var(--sidebar-bot))',
+    borderRight: '1px solid var(--line)', display: 'flex', flexDirection: 'column', padding: 16,
+    overflowY: 'auto',
+  };
+
   return (
-    <aside style={{
-      width: 248, flexShrink: 0, height: '100vh', position: 'sticky', top: 0,
-      background: 'linear-gradient(180deg, var(--sidebar-top), var(--sidebar-bot))',
-      borderRight: '1px solid var(--line)', display: 'flex', flexDirection: 'column', padding: 16,
-      overflowY: 'auto',
-    }}>
-      {/* Brand */}
-      <div style={{ padding: '6px 6px 14px' }}>
+    <aside style={sidebarStyle}>
+      {/* Brand + (mobile) close button */}
+      <div style={{ padding: '6px 6px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Wordmark size={16.5} markSize={32} />
+        {isMobile && (
+          <button
+            onClick={onMobileClose}
+            style={{ padding: 6, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid var(--line)', color: 'var(--ink-3)', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+            aria-label="Close menu"
+          >
+            <X size={16} />
+          </button>
+        )}
       </div>
 
       {/* Repo switcher */}
@@ -107,11 +145,65 @@ export function AppSidebar({ activePage, onNavigate, user, onLogout, repos = [],
       )}
 
       {/* Connected to GitHub strip */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 2px 16px', padding: '8px 10px', borderRadius: 10, background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '12px 2px 8px', padding: '8px 10px', borderRadius: 10, background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)' }}>
         <GitHubIcon size={15} style={{ color: '#fff' }} />
         <span style={{ fontSize: 11.5, color: '#a7f3d0', fontWeight: 600 }}>Connected to GitHub</span>
         <span className="dot dot-pulse" style={{ background: '#34d399', marginLeft: 'auto' }} />
       </div>
+
+      {/* Mobile-only: branch picker + action buttons (topbar controls move here) */}
+      {isMobile && selectedRepo && (
+        <div style={{ margin: '4px 2px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {selectedBranch && onBranchChange && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 600, minWidth: 48 }}>Branch</span>
+              <BranchPicker
+                repoFullName={selectedRepo.full_name}
+                defaultBranch={selectedRepo.default_branch}
+                selected={selectedBranch}
+                onChange={onBranchChange}
+                accessToken={accessToken ?? null}
+                disabled={analyzing}
+              />
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => { onAnalyze?.(); onMobileClose?.(); }}
+              disabled={analyzing || !selectedRepo}
+              style={{ flex: 1, justifyContent: 'center' }}
+            >
+              <Zap size={14} /> {analyzing ? 'Running…' : 'Run Analysis'}
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => { onAutoFix?.(); onMobileClose?.(); }}
+              disabled={analyzing || !selectedRepo}
+              title="Auto-fix loop"
+            >
+              <Sparkles size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Mobile-only: user status row */}
+      {isMobile && user && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 2px 12px', padding: '8px 10px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid var(--line)' }}>
+          {user.avatar_url
+            ? <img src={user.avatar_url} alt="" style={{ width: 28, height: 28, borderRadius: 8, objectFit: 'cover', flexShrink: 0 }} />
+            : <div style={{ width: 28, height: 28, borderRadius: 8, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff', flexShrink: 0 }}>
+                {(user.name ?? user.login).slice(0, 2).toUpperCase()}
+              </div>
+          }
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 650, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user.name || user.login}</div>
+            <div className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>@{user.login}</div>
+          </div>
+          <Bell size={15} style={{ color: 'var(--ink-3)', flexShrink: 0 }} />
+        </div>
+      )}
 
       {/* Nav label */}
       <div className="eyebrow" style={{ padding: '0 8px 8px' }}>Navigate</div>

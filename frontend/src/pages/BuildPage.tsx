@@ -215,7 +215,7 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
   }
 
   return (
-    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.2,0.7,0.2,1] }}
+    <motion.div className="page-content" initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.2,0.7,0.2,1] }}
       style={{ padding: '28px 32px', maxWidth: 1100, margin: '0 auto', width: '100%' }}>
 
       {/* Header */}
