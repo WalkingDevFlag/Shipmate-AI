@@ -14,9 +14,9 @@ back (get_log_tail / list_active project token-less columns).
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.services import inflight_registry as ir
 from app.services.ci_watcher import CIWatcher
@@ -53,5 +53,12 @@ async def get_watcher_log(
 
 
 @router.delete("/watcher/{owner}/{repo}/{pr_number}")
-async def stop_watcher(owner: str, repo: str, pr_number: int) -> Dict[str, bool]:
+async def stop_watcher(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, bool]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     return {"stopped": CIWatcher.stop(owner, repo, pr_number)}

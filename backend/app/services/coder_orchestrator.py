@@ -36,6 +36,7 @@ from app.schemas.api_schemas import (
 )
 from app.services import ast_lint
 from app.services import inflight_registry as ir
+from app.services import sandbox
 from app.services import scope_guard as sg
 from app.services import validation_gate as vg
 from app.services.github_api_service import GitHubAPIService
@@ -51,9 +52,101 @@ logger = logging.getLogger("shipmate.coder_orchestrator")
 # can disable it.
 _PYTEST_GATE_ENABLED = os.getenv("SHIPMATE_PYTEST_GATE", "1") == "1"
 
+# EvalOps acceptance gate (P5). OFF by default: it boots the patched app in a
+# worktree and runs a generated ValidationSpec, which adds latency + an LLM
+# call per actuate, so it's opt-in until proven. Fail-open everywhere when on.
+_EVAL_GATE_ENABLED = os.getenv("SHIPMATE_EVAL_GATE", "0").strip().lower() in ("1", "true", "yes")
+
 # Hard ceiling on the parallel file-content fetch so a hung GitHub connection
 # can't pin the actuate worker thread indefinitely (the gather had no timeout).
 _FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FETCH_TIMEOUT_S", "45"))
+
+# Hard ceiling per Coder LLM call. Without this a stalled provider response
+# pins the worker thread (and, via actuate_stream, the SSE connection) for the
+# full request — observed at ~900s when two large full-file generations ran
+# concurrently. Set DELIBERATELY BELOW the shared provider read_timeout (300s,
+# bedrock_provider.py) so this guard frees the awaiting request/SSE first; the
+# orphaned worker thread then drains on the provider's own read-timeout. We do
+# NOT lower the provider timeout itself — that client is a process-wide
+# singleton shared with the planner/repo_analyst agents, whose legitimate calls
+# can run long. Mirrors the _FETCH_TIMEOUT_S guard already used for GitHub I/O.
+_LLM_TIMEOUT_S = float(os.getenv("SHIPMATE_LLM_TIMEOUT_S", "240"))
+
+# Auto-engage diff mode when any target file is at least this many lines. Full
+# rewrites of large files are slow (timeout risk) and tempt the model to bail
+# to `skipped`. Diff mode emits a small unified diff instead, auto-falling back
+# to full-file if the diff fails to apply.
+_DIFF_AUTO_LINES = int(os.getenv("SHIPMATE_DIFF_AUTO_LINES", "400"))
+
+
+async def _run_coder(agent: "CoderAgent", *args) -> "CoderOutput":
+    """Bound a single Coder call so a hung provider can't pin the request/SSE
+    indefinitely. Raises asyncio.TimeoutError on expiry; run_actuation maps it
+    to status='timeout'. Note: cancelling the to_thread frees the awaiting
+    coroutine but cannot kill the worker thread — the thread drains when the
+    provider's own read_timeout (300s, > this deadline) fires. Bounding the
+    request promptly is the point; the thread cleans up shortly after."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(agent.run, *args), _LLM_TIMEOUT_S,
+    )
+
+
+async def _run_coder_feedback(agent, brief, issues, hint) -> "CoderOutput":
+    """Bounded re-prompt that feeds concrete issues back to the Coder. Same
+    deadline as _run_coder; used by the phantom-patch guard for its one retry."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(agent.run_with_lint_feedback, brief, issues, hint),
+        _LLM_TIMEOUT_S,
+    )
+
+
+# Feedback fed to the Coder when its first response was an empty patch that
+# nonetheless claimed a fix (phantom). Names the contradiction explicitly.
+_PHANTOM_FEEDBACK = [
+    "Your previous response returned ZERO file edits but the summary described "
+    "a change as if it had been made. That is a phantom patch and is rejected. "
+    "Either emit the ACTUAL complete file content for every file you change, or "
+    "— if you genuinely cannot make this change — return no files and set the "
+    "summary to exactly 'DECLINED: <one-line reason>'. Do not write a VERIFY "
+    "line on an empty patch.",
+]
+
+
+def _looks_like_phantom(coder_out) -> bool:
+    """A phantom patch = zero file edits AND a summary that reads like a fix was
+    made (carries the mandatory 'VERIFY:' self-check stamp, or is a multi-word
+    narration) rather than an honest 'DECLINED:'. An explicit decline is NOT a
+    phantom — we only retry the dishonest-looking empties."""
+    if getattr(coder_out, "files", None):
+        return False
+    summary = (getattr(coder_out, "summary", "") or "").strip()
+    if not summary:
+        return False
+    low = summary.lower()
+    if low.startswith("declined"):
+        return False  # honest decline — accept as-is, don't retry
+    # Clean VERIFY stamp on an empty patch is the signature contradiction; a
+    # long narration without a decline is also suspect.
+    return ("verify:" in low and "fail:" not in low) or len(summary.split()) >= 8
+
+
+def _honest_empty_summary(coder_out) -> str:
+    """Strip a phantom's clean VERIFY stamp from the user-facing summary so an
+    empty patch never reports as a clean success. Honest declines pass through."""
+    summary = (getattr(coder_out, "summary", "") if coder_out else "") or ""
+    summary = summary.strip()
+    if not summary:
+        return "Coder produced no patch."
+    if summary.lower().startswith("declined"):
+        return summary
+    # Strip the VERIFY stamp wherever it sits (own line OR inline, since the
+    # model often appends it to the last sentence) — it would otherwise read as
+    # a passed check on an empty patch. Cut from the first 'VERIFY:' onward.
+    low = summary.lower()
+    idx = low.find("verify:")
+    cleaned = (summary[:idx] if idx != -1 else summary).strip()
+    cleaned = " ".join(cleaned.split()) or "(no detail)"
+    return f"No patch produced (Coder returned no file edits). Coder note: {cleaned[:240]}"
 
 # The repo this backend checkout corresponds to. The pytest gate only fires
 # when the actuate target matches — otherwise we'd be running ShipMate's own
@@ -360,6 +453,13 @@ def _lint_coder_output(
     benefit from AST).
     """
     issues: List[str] = []
+    # Files created IN THIS patch are valid import targets even though they
+    # are not in the existing GitHub tree yet. Without this, the textbook
+    # "extract into a shared module" refactor (create app/services/sse.py AND
+    # `from app.services.sse import …` in the same patch) is wrongly rejected
+    # as a hallucinated import. The stale-named check below already trusts
+    # coder_out.files; the existence check (detect_bad_imports) must too.
+    tree_with_patch = list(file_tree) + [cf.path for cf in coder_out.files]
     for cf in coder_out.files:
         original = target_files.get(cf.path, "")
 
@@ -370,7 +470,7 @@ def _lint_coder_output(
                 issues.append(syntax_err)
                 continue  # skip further checks — they'd just re-report the parse failure
 
-            bad = ast_lint.detect_bad_imports(cf.new_content, original, file_tree)
+            bad = ast_lint.detect_bad_imports(cf.new_content, original, tree_with_patch)
             if bad:
                 issues.append(
                     f"{cf.path}: hallucinated first-party imports not in repo or "
@@ -420,6 +520,22 @@ def _lint_coder_output(
                         "pattern the inbound sanitizer blocks. Use a safe alternative."
                     )
     return issues
+
+
+def _build_repo_map(
+    file_tree: List[str],
+    target_files: Dict[str, str],
+    target_paths: List[str],
+) -> str:
+    """Build the Coder repo map (real modules + exported symbols) for the brief.
+    Fail-open: any error returns "" so a malformed tree can never break an
+    actuate — the Coder just runs without the map section, as it did before."""
+    try:
+        from app.services import repo_map as rm
+        return rm.build_repo_map(file_tree or [], target_files or {}, target_paths or [])
+    except Exception as e:  # pragma: no cover - fail-open
+        logger.debug("repo_map build skipped (%s)", e)
+        return ""
 
 
 def _build_task(finding: FindingPayload, repo_full_name: str = "") -> str:
@@ -530,12 +646,21 @@ class CoderOrchestrator:
                 tech_stack=ctx.tech_stack,
                 entry_points=ctx.entry_points,
                 target_files=step_targets,
+                # Map built from working_files (originals + prior steps' output),
+                # so step N sees the REAL symbols step N-1 just defined — the
+                # same ground truth the merged target_files carry.
+                repo_map=_build_repo_map(
+                    file_tree, working_files, list(step.target_paths),
+                ),
                 finding_kind=req.finding.kind,
                 finding_id=f"{req.finding.id}-step{idx + 1}",
                 finding_severity=req.finding.severity,
+                finding_category=getattr(req.finding, "category", "") or "",
             )
-            step_out: CoderOutput = await asyncio.to_thread(
-                agent.run, step_brief, hint, mode,
+            # Bounded per step — a hung step raises asyncio.TimeoutError, which
+            # propagates to run_actuation's timeout handler (status='timeout').
+            step_out: CoderOutput = await _run_coder(
+                agent, step_brief, hint, mode,
             )
             for cf in step_out.files:
                 merged[cf.path] = cf
@@ -548,6 +673,123 @@ class CoderOrchestrator:
             skipped=[],
             summary=summary,
         )
+
+    @classmethod
+    async def _run_verify_loop(
+        cls, req, brief, agent, coder_out, target_files, file_tree, emit,
+    ):
+        """Run the inner verify-loop (Phase 4) over the Coder's first output.
+
+        Composes the cheap checks (lint + scope + sandbox smoke) and a feedback
+        callback that re-prompts the Coder with the skill-composed prompt, then
+        hands both to verify_loop.run_verify_loop. The smoke check executes in a
+        throwaway worktree, so it's safe to run before path claims. Returns
+        (final_coder_out, VerifyLoopResult).
+
+        Fail-open is DEFENSIVE, not permissive: if the loop can't run, we still
+        evaluate the cheap PURE checks (lint + scope, no execution) once so a
+        hallucinated-import / scope-drift patch is never shipped unlinted —
+        only the EXECUTION step (smoke) and the iteration are skipped."""
+        from app.services import verify_checks
+        from app.services import verify_loop
+
+        repo_full = f"{req.owner}/{req.repo}"
+        hint = _deployment_hint(req.finding)
+        kind = req.finding.kind
+        category = getattr(req.finding, "category", "") or ""
+
+        def _pure_only_result():
+            """Fallback: run lint + scope (no execution) ONCE and report their
+            real verdict — so a setup/loop error degrades to the pre-Phase-4
+            single-pass lint+scope behaviour, NOT to shipping unverified code."""
+            try:
+                pure = verify_checks.default_checks(
+                    kind, category, target_files, file_tree, include_smoke=False,
+                )
+                agg = verify_loop._run_checks(coder_out, pure)
+                return verify_loop.VerifyLoopResult(
+                    coder_out, not agg.issues, 0, list(agg.issues),
+                    "clean" if not agg.issues else "setup_error", [],
+                    [n for n in agg.name.split(",") if n],
+                )
+            except Exception as e:  # pragma: no cover - last-resort fail-open
+                logger.debug("verify-loop pure fallback failed (%s)", e)
+                return verify_loop.VerifyLoopResult(coder_out, True, 0, [], "clean")
+
+        # The smoke (execution) step is only meaningful on ShipMate's own
+        # checkout AND when the pytest gate is enabled — it shares the gate's
+        # kill-switch so a hosted deploy that sets SHIPMATE_PYTEST_GATE=0 (per
+        # the runbook) doesn't silently re-introduce execution here. For an
+        # external repo there's no local app.main to import. Either way the
+        # pure lint+scope checks still run.
+        include_smoke = repo_full == _SELF_REPO and _PYTEST_GATE_ENABLED
+
+        try:
+            checks = verify_checks.default_checks(
+                kind, category, target_files, file_tree,
+                include_smoke=include_smoke,
+            )
+        except Exception as e:  # pragma: no cover - fail-open to pure checks
+            logger.debug("verify-loop check build failed (%s) — pure-check fallback", e)
+            return coder_out, _pure_only_result()
+
+        def _feedback(issues):
+            # Re-prompt the Coder with the concrete issues. Synchronous (the
+            # loop runs on a worker thread via asyncio.to_thread below).
+            try:
+                return agent.run_with_lint_feedback(brief, issues, hint)
+            except Exception as e:
+                logger.warning("verify-loop feedback re-prompt raised %s", e)
+                return None
+
+        # Secondary bound: a soft approx-token ceiling so the loop can't keep
+        # re-prompting deep into a token-heavy analyze/actuate run. Read from
+        # env (0/unset ⇒ iteration cap only, the conservative default). When set,
+        # the loop stops re-prompting once the active run's spent tokens leave
+        # less than the per-Coder-call headroom.
+        token_budget = None
+        try:
+            _tb = int(os.getenv("SHIPMATE_VERIFY_TOKEN_BUDGET", "0") or "0")
+            token_budget = _tb if _tb > 0 else None
+        except ValueError:
+            token_budget = None
+
+        # The loop calls the (blocking) Coder + subprocess smoke, so run the
+        # whole thing on a worker thread to keep the event loop free.
+        def _drive():
+            return verify_loop.run_verify_loop(
+                coder_out, checks, _feedback, token_budget=token_budget,
+            )
+
+        try:
+            # The loop re-prompts the Coder up to verify_loop._DEFAULT_MAX_ITERS
+            # times; bound the whole drive so a hung re-prompt can't pin the
+            # request past a few per-call deadlines. On timeout, degrade to the
+            # pure lint+scope verdict on the candidate we already have rather
+            # than hanging — same fail-open as the exception path below.
+            loop = await asyncio.wait_for(
+                asyncio.to_thread(_drive),
+                _LLM_TIMEOUT_S * (verify_loop._DEFAULT_MAX_ITERS + 1),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "verify-loop exceeded its deadline — pure-check fallback on the "
+                "candidate in hand",
+            )
+            return coder_out, _pure_only_result()
+        except Exception as e:  # pragma: no cover - fail-open to pure checks
+            logger.warning("verify-loop raised %s — pure-check fallback", e)
+            return coder_out, _pure_only_result()
+
+        await emit("verify-loop.done", iterations=loop.iterations,
+                   passed=loop.passed, stop_reason=loop.stop_reason)
+        logger.info(
+            "verify-loop %s/%s: %s after %d iter(s) (%s)",
+            req.finding.kind, req.finding.id,
+            "passed" if loop.passed else "failed",
+            loop.iterations, loop.stop_reason,
+        )
+        return loop.coder_out, loop
 
     @classmethod
     async def run_actuation(
@@ -605,79 +847,164 @@ class CoderOrchestrator:
             tech_stack=ctx.tech_stack,
             entry_points=ctx.entry_points,
             target_files=target_files,
+            # Real module/symbol map so Coder imports only what exists — the
+            # prevention half of the hallucinated-import defense ast_lint cures.
+            repo_map=_build_repo_map(file_tree, target_files, target_paths),
             finding_kind=req.finding.kind,
             finding_id=req.finding.id,
             finding_severity=req.finding.severity,
+            finding_category=getattr(req.finding, "category", "") or "",
         )
         agent = CoderAgent()
-        _mode = "diff" if getattr(req, "diff_mode", False) else "full"
-        if getattr(req, "decompose", False):
-            coder_out = await cls._run_decomposed(
-                req, ctx, file_tree, target_files, _mode,
+        # Diff mode when explicitly requested OR auto-engaged for large target
+        # files: reprinting a 1200-line file verbatim to add a 3-line change is
+        # what blows the LLM timeout and tempts the model to bail to `skipped`.
+        # CoderAgent auto-falls-back to full-file on any diff-apply failure, so
+        # this only ever saves work — it never blocks a patch.
+        _auto_diff = any(
+            (c or "").count("\n") + 1 > _DIFF_AUTO_LINES
+            for c in target_files.values()
+        )
+        _mode = "diff" if (getattr(req, "diff_mode", False) or _auto_diff) else "full"
+        if _auto_diff and not getattr(req, "diff_mode", False):
+            logger.info(
+                "auto-engaging diff mode for %s/%s: a target file exceeds %d lines",
+                req.finding.kind, req.finding.id, _DIFF_AUTO_LINES,
             )
-        else:
-            coder_out = await asyncio.to_thread(
-                agent.run, brief, _deployment_hint(req.finding), _mode,
+        try:
+            if getattr(req, "decompose", False):
+                coder_out = await cls._run_decomposed(
+                    req, ctx, file_tree, target_files, _mode,
+                )
+            else:
+                coder_out = await _run_coder(
+                    agent, brief, _deployment_hint(req.finding), _mode,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Coder call exceeded %.0fs for %s/%s — returning timeout",
+                _LLM_TIMEOUT_S, req.finding.kind, req.finding.id,
+            )
+            await _emit("done", status="timeout", pr_url=None)
+            return ActuateResponse(
+                status="timeout",
+                pr_url=None,
+                branch_name=branch_name,
+                files_changed=[],
+                skipped=target_paths,
+                summary=(
+                    f"Coder call exceeded the {_LLM_TIMEOUT_S:.0f}s deadline "
+                    f"(SHIPMATE_LLM_TIMEOUT_S) and was aborted. No patch produced."
+                ),
+            )
+        except Exception as e:
+            # A malformed model response (e.g. Bedrock returns a CoderOutput
+            # missing a required field even after the provider's array-not-string
+            # retry) raises here. That's a flaky-LLM outcome, NOT a server fault —
+            # fail SOFT to a coder_error status (like timeout) instead of letting
+            # it surface as a 500. Callers already treat any status != "complete"
+            # as a non-shipping outcome, so this slots in cleanly.
+            logger.warning(
+                "Coder call failed for %s/%s (%s: %s) — returning coder_error",
+                req.finding.kind, req.finding.id, type(e).__name__, str(e)[:200],
+            )
+            _record_coder_lessons(
+                f"{req.owner}/{req.repo}", "coder_error", [f"{type(e).__name__}: {str(e)[:160]}"]
+            )
+            await _emit("done", status="coder_error", pr_url=None)
+            return ActuateResponse(
+                status="coder_error",
+                pr_url=None,
+                branch_name=branch_name,
+                files_changed=[],
+                skipped=target_paths,
+                summary=(
+                    f"Coder produced an unusable response ({type(e).__name__}). "
+                    f"No patch was applied. Re-run to retry."
+                ),
             )
         await _emit("coding.done", files=[cf.path for cf in coder_out.files])
 
         if not coder_out.files:
-            # Coder decided no change is needed (or skipped everything).
-            await _emit("done", status="no_change", pr_url=None)
-            return ActuateResponse(
-                status="no_change",
-                pr_url=None,
-                branch_name=branch_name,
-                files_changed=[],
-                skipped=coder_out.skipped or target_paths,
-                summary=coder_out.summary or "Coder determined no patch was needed.",
-            )
-
-        # 3b. Quality lint — reject hallucinations BEFORE branching/committing.
-        # This is the second line of defense after the system prompt — if Coder
-        # invents imports despite rule #1, we catch it here and return a clean
-        # error instead of opening a bogus PR.
-        await _emit("gate.start", phase="lint")
-        lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
-        if lint_issues:
-            # One auto-retry with the issues fed back to Coder before giving
-            # up. A large fraction of lint rejections are first-shot
-            # hallucinated imports the model will fix when told exactly what
-            # was wrong — cheaper than a wasted PR or a human round-trip.
-            logger.warning(
-                "Coder output rejected by post-lint for %s/%s: %s — retrying once with feedback",
-                req.finding.kind, req.finding.id, lint_issues,
-            )
-            try:
-                coder_out = await asyncio.to_thread(
-                    agent.run_with_lint_feedback, brief, lint_issues,
-                    _deployment_hint(req.finding),
+            # Empty patch. Distinguish an HONEST decline from a PHANTOM patch —
+            # zero files but a confident VERIFY-clean summary that narrates a
+            # fix it never emitted (observed live on a cross-cutting finding).
+            # On a phantom, re-prompt ONCE with the contradiction made explicit
+            # before accepting no_change; an honest decline is returned as-is.
+            if _looks_like_phantom(coder_out):
+                logger.warning(
+                    "phantom patch for %s/%s (empty files + clean VERIFY) — one retry",
+                    req.finding.kind, req.finding.id,
                 )
-            except Exception as e:
-                logger.warning("lint-feedback retry raised %s; keeping first output", e)
-            if coder_out.files:
-                lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
+                await _emit("coding.retry", reason="phantom")
+                try:
+                    coder_out = await _run_coder_feedback(
+                        agent, brief, _PHANTOM_FEEDBACK, _deployment_hint(req.finding),
+                    )
+                except asyncio.TimeoutError:
+                    coder_out = None  # fall through to no_change below
 
-        if lint_issues or not coder_out.files:
+            if not coder_out or not coder_out.files:
+                _record_coder_lessons(
+                    f"{req.owner}/{req.repo}", "phantom",
+                    [(getattr(coder_out, "summary", "") or "")[:200]
+                     or "empty patch"],
+                )
+                await _emit("done", status="no_change", pr_url=None)
+                return ActuateResponse(
+                    status="no_change",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=(getattr(coder_out, "skipped", None) or target_paths),
+                    summary=_honest_empty_summary(coder_out),
+                )
+
+        # 3b. Inner verify-loop (Phase 4) — iterate the Coder against the CHEAP
+        # checks (AST lint + scope guard + sandbox import-smoke) BEFORE touching
+        # GitHub or the expensive full pytest gate. This unifies what used to be
+        # three scattered one-shot feedback retries (lint, scope) into one
+        # bounded loop: generate → cheap-verify → feed concrete errors back →
+        # repeat, ≤ max_iters and ≤ token budget. Each re-prompt uses the
+        # skill-composed prompt (P3); the smoke runs in a throwaway worktree
+        # (P2, race-free); the brief carries the repo map (P1).
+        await _emit("gate.start", phase="verify-loop")
+        repo_full = f"{req.owner}/{req.repo}"
+        coder_out, loop = await cls._run_verify_loop(
+            req, brief, agent, coder_out, target_files, file_tree, _emit,
+        )
+
+        if not coder_out.files or not loop.passed:
+            outstanding = loop.issues or ["Coder produced no usable files"]
             logger.warning(
-                "Coder output still rejected after lint-feedback retry for %s/%s: %s",
-                req.finding.kind, req.finding.id, lint_issues,
+                "verify-loop did not converge for %s/%s after %d iter(s) (%s): %s",
+                req.finding.kind, req.finding.id, loop.iterations,
+                loop.stop_reason, outstanding,
             )
-            # Failure-memory (B2): distill the lint issues into durable lessons
-            # for this repo so the NEXT Coder brief warns against repeating them.
-            _record_coder_lessons(f"{req.owner}/{req.repo}", "lint", lint_issues)
-            await _emit("done", status="lint_rejected", pr_url=None)
+            # Classify by WHICH check failed (the loop tags each), not by
+            # sniffing issue text — scope_guard's catch-all "DELETES N of M
+            # lines" message carries none of the old keyword markers. A scope
+            # failure surfaces as scope_rejected, everything else lint_rejected.
+            scope_failed = "scope" in (loop.failed_checks or [])
+            # Failure-memory (B2): record under the gate that actually failed so
+            # the lessons signal isn't flattened to always-"lint".
+            _record_coder_lessons(
+                repo_full, "scope" if scope_failed else "lint", outstanding,
+            )
+            status = "scope_rejected" if scope_failed else "lint_rejected"
+            await _emit("done", status=status, pr_url=None)
             return ActuateResponse(
-                status="lint_rejected",
+                status=status,
                 pr_url=None,
                 branch_name=branch_name,
                 files_changed=[],
                 skipped=[cf.path for cf in coder_out.files],
                 summary=(
-                    f"Coder produced output but post-lint rejected it (after "
-                    f"one feedback retry): {'; '.join(lint_issues) or 'no files'}. "
-                    f"The patch was discarded and no branch/PR was created. "
-                    f"Original Coder summary: {coder_out.summary[:300]}"
+                    f"Coder output rejected by the verify-loop after "
+                    f"{loop.iterations} feedback iteration(s) "
+                    f"({loop.stop_reason}): {'; '.join(outstanding) or 'no files'}. "
+                    f"No branch/PR was created. "
+                    f"Coder summary: {coder_out.summary[:300]}"
                 ),
             )
 
@@ -685,7 +1012,7 @@ class CoderOrchestrator:
         # CLI loop (or two UI clicks) can't both rewrite the same file. If
         # any path is already claimed, bail with `path_busy` immediately
         # (user-facing retry — see ActuateButton). Always released in `finally`.
-        repo_full = f"{req.owner}/{req.repo}"
+        # (repo_full was set above for the verify-loop.)
         claimed_paths: List[str] = []
         claimer = f"actuate:{req.finding.kind}:{req.finding.id}"
         sig = _finding_signature(req.finding)
@@ -709,70 +1036,76 @@ class CoderOrchestrator:
                     )
                 claimed_paths.append(cf.path)
 
-            # 3c.5. Scope-discipline guard. Pure text analysis (no local tree
-            # needed) so it runs for ALL repos, not just the dogfood case.
-            # Catches whole-file rewrites that silently drop pre-existing
-            # top-level defs (the untested-_lifespan-hook miss) or delete lines
-            # from protected config files (the .gitignore miss) — drift the
-            # pass-count gate can't see. Reject before touching GitHub.
+            # Serialize the verify-loop's surviving output for the downstream
+            # pytest gate / commit. Lint + scope + smoke already passed inside
+            # the loop (3b); the path claim above is the first GitHub-touching
+            # step, taken on the loop's FINAL file set.
             serialized = [
                 {"path": cf.path, "new_content": cf.new_content,
                  "rationale": cf.rationale}
                 for cf in coder_out.files
             ]
-            await _emit("gate.start", phase="scope")
-            scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
-            if scope_issues:
-                # One auto-retry feeding the scope violations back to the Coder
-                # before giving up — same rationale as the lint-feedback retry:
-                # a whole-file rewrite that dropped an untested def is often
-                # fixed when the model is told exactly which lines it must
-                # preserve, cheaper than a wasted human round-trip. (Previously
-                # only lint failures got a retry; scope failures hard-rejected.)
-                logger.warning(
-                    "scope guard rejected %s/%s: %s — retrying once with feedback",
-                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
-                )
-                try:
-                    coder_out = await asyncio.to_thread(
-                        agent.run_with_lint_feedback, brief, scope_issues,
-                        _deployment_hint(req.finding),
-                    )
-                    serialized = [
-                        {"path": cf.path, "new_content": cf.new_content,
-                         "rationale": cf.rationale}
-                        for cf in coder_out.files
-                    ]
-                    scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
-                except Exception as e:
-                    logger.warning("scope-feedback retry raised %s; keeping first output", e)
-            if scope_issues:
-                logger.warning(
-                    "scope guard still rejected %s/%s after feedback retry: %s",
-                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
-                )
-                _record_coder_lessons(repo_full, "scope", scope_issues)
-                await _emit("done", status="scope_rejected", pr_url=None)
-                return ActuateResponse(
-                    status="scope_rejected",
-                    pr_url=None,
-                    branch_name=branch_name,
-                    files_changed=[],
-                    skipped=[cf.path for cf in coder_out.files],
-                    summary=(
-                        f"Patch passed lint but failed the scope-discipline guard: "
-                        f"{' | '.join(scope_issues)} No branch/PR was created. "
-                        f"Coder summary: {coder_out.summary[:200]}"
-                    ),
-                )
 
             # 3d. Local pytest gate — only when actuating THIS repo on a local
             # checkout (the dogfood case). For external repos there's no local
             # tree to test against, so we skip. Snapshot → apply → smoke import
             # → pytest → restore-on-regression. If the patch drops the pass
             # count, reject with `pytest_rejected` and DON'T open a PR.
+            # Per-finding gate tier (Phase 2): a docs-only edit doesn't warrant
+            # a full ~45s pytest run, while a security patch does. gate_for is
+            # deterministic (no LLM) and fail-safe (unknown → full). A
+            # lint/import-smoke tier downgrades the HEAVY pytest gate to a
+            # cheaper check; every other tier runs the full gate below.
+            try:
+                _tier = sandbox.gate_for(
+                    req.finding.kind, getattr(req.finding, "category", "") or "",
+                )
+            except Exception:
+                _tier = None
+            # Only the lint tier skips ALL execution (pure prose). An
+            # import-smoke tier (deps/manifest edits) must still RUN the smoke
+            # check — skipping it entirely would let a manifest edit that breaks
+            # `import app.main` open a PR with zero validation.
+            _lint_only_tier = _tier is not None and not _tier.run_pytest and not _tier.run_smoke
+            _smoke_only_tier = _tier is not None and _tier.run_smoke and not _tier.run_pytest
+
             gate_ran = False
-            if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
+            if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO and _lint_only_tier:
+                logger.info(
+                    "pytest gate SKIPPED for %s/%s — tier '%s' (%s)",
+                    req.finding.kind, req.finding.id, _tier.name, _tier.description,
+                )
+                await _emit("gate.skip", phase="pytest", tier=_tier.name)
+            elif _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO and _smoke_only_tier:
+                # Apply the patch, run ONLY the import smoke, restore. Catches a
+                # manifest/dependency edit that breaks the entry-point import
+                # without paying for the full suite.
+                gate_ran = True
+                await _emit("gate.start", phase="import-smoke", tier=_tier.name)
+                snap = await asyncio.to_thread(vg.snapshot_files,
+                                               [cf["path"] for cf in serialized])
+                await asyncio.to_thread(vg.write_files_to_tree, serialized)
+                smoke_ok, smoke_err = await asyncio.to_thread(vg.smoke_imports)
+                await asyncio.to_thread(vg.restore_snapshot, snap)
+                if not smoke_ok:
+                    _record_coder_lessons(repo_full, "pytest",
+                                          f"import smoke failed: {smoke_err[:200]}")
+                    await _emit("done", status="pytest_rejected", pr_url=None)
+                    return ActuateResponse(
+                        status="pytest_rejected",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Patch (tier '{_tier.name}') broke the entry-point import: "
+                            f"{smoke_err[:200]}. No PR was created. "
+                            f"Coder summary: {coder_out.summary[:200]}"
+                        ),
+                    )
+                logger.info("import-smoke gate passed for %s/%s (tier '%s')",
+                            req.finding.kind, req.finding.id, _tier.name)
+            elif _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
                 gate_ran = True
                 await _emit("gate.start", phase="pytest")
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
@@ -787,8 +1120,8 @@ class CoderOrchestrator:
                         req.finding.kind, req.finding.id, result.reason,
                     )
                     try:
-                        coder_out = await asyncio.to_thread(
-                            agent.run_with_lint_feedback, brief,
+                        coder_out = await _run_coder_feedback(
+                            agent, brief,
                             [f"Your patch broke the test suite: {result.reason}. "
                              "Fix the regression while still addressing the finding."],
                             _deployment_hint(req.finding),
@@ -799,7 +1132,12 @@ class CoderOrchestrator:
                             for cf in coder_out.files
                         ]
                         # Re-lint + re-scope the retry output before re-gating.
-                        if _lint_coder_output(coder_out, target_files, file_tree) or \
+                        # An EMPTY retry (model declined under pressure) must NOT
+                        # count as a pass — an empty patch trivially has no test
+                        # regression, which would otherwise fall through to an
+                        # empty 'complete'. Keep the original rejection instead.
+                        if not coder_out.files or \
+                                _lint_coder_output(coder_out, target_files, file_tree) or \
                                 sg.check_patch(serialized, target_files, coder_out.summary):
                             result, snap = (result, snap)  # keep failed result
                         else:
@@ -900,6 +1238,87 @@ class CoderOrchestrator:
                         "Patch passed lint/tests but did NOT remove the issue it "
                         "targets (the offending pattern is still present), so no PR "
                         f"was opened. Coder summary: {coder_out.summary[:200]}"
+                    ),
+                )
+
+            # 3f. EvalOps acceptance gate (P5) — for feature/milestone findings
+            # on the dogfood repo, "shipped" should mean "the change WORKS", not
+            # just "it linted + passed pytest". Generate a ValidationSpec for the
+            # finding and run it against the PATCHED app in a throwaway worktree;
+            # reject (eval_rejected) if the scenarios fail. Opt-in via
+            # SHIPMATE_EVAL_GATE (default off so the hot actuate path is
+            # unchanged until explicitly enabled). Fully fail-open: any eval-infra
+            # error or a spec that couldn't run is treated as NO SIGNAL (never
+            # blocks a patch), mirroring test_synthesizer's report.ran semantics.
+            if (_EVAL_GATE_ENABLED and repo_full == _SELF_REPO
+                    and req.finding.kind in ("milestone", "blocker", "next_action")):
+                try:
+                    from app.services import define_validation, eval_runner
+                    from app.services.llm_service import LLMService
+                    provider = LLMService.provider()
+                    spec = define_validation.define_spec(req.finding, provider)
+                    await _emit("gate.start", phase="eval", spec=spec.name)
+                    # trusted=True: this is the SELF-repo dogfood patch — the
+                    # eval must boot the REAL app (needs the real env to import
+                    # providers/stores), and the gate only fires for _SELF_REPO,
+                    # so there's no untrusted-code exposure here. (A stripped env
+                    # would cripple the boot and could noise up the signal.)
+                    report = await asyncio.to_thread(
+                        lambda: eval_runner.run_eval_in_worktree(
+                            spec, serialized, trusted=True,
+                        ),
+                    )
+                    if report is not None and report.ran and not report.passed:
+                        fails = [x for s in report.scenarios for x in s.failures][:3]
+                        _record_coder_lessons(
+                            repo_full, "eval",
+                            f"EvalOps spec '{spec.name}' failed: {'; '.join(fails) or 'see report'}",
+                        )
+                        await _emit("done", status="eval_rejected", pr_url=None)
+                        return ActuateResponse(
+                            status="eval_rejected",
+                            pr_url=None,
+                            branch_name=branch_name,
+                            files_changed=[],
+                            skipped=[cf.path for cf in coder_out.files],
+                            summary=(
+                                f"Patch passed lint/tests but FAILED its EvalOps "
+                                f"acceptance spec ('{spec.name}'): "
+                                f"{'; '.join(fails) or 'scenarios did not pass'}. No PR "
+                                f"was opened. Coder summary: {coder_out.summary[:200]}"
+                            ),
+                        )
+                    if report is not None and report.passed:
+                        logger.info("eval gate PASSED for %s/%s (spec '%s')",
+                                    req.finding.kind, req.finding.id, spec.name)
+                except Exception as e:  # pragma: no cover - fail-open
+                    logger.debug("eval gate skipped (fail-open): %s", e)
+
+            # Backstop: never create a branch / return 'complete' for an empty
+            # file set. A gate retry (e.g. the pytest-feedback re-prompt above)
+            # can overwrite coder_out with an empty patch, which would otherwise
+            # fall through to an empty branch + a misleading 'complete' with
+            # files_changed=[] (observed live when auto-diff tripped the retry).
+            # An empty set this late is a no_change, not a success.
+            if not coder_out.files:
+                logger.warning(
+                    "empty file set reached the commit stage for %s/%s "
+                    "(likely a gate retry emptied the patch) — returning no_change",
+                    req.finding.kind, req.finding.id,
+                )
+                _record_coder_lessons(
+                    repo_full, "phantom", ["empty patch after gate retry"],
+                )
+                await _emit("done", status="no_change", pr_url=None)
+                return ActuateResponse(
+                    status="no_change",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=target_paths,
+                    summary=(
+                        "No patch produced — the Coder's gate-retry returned an "
+                        "empty file set, so nothing was committed."
                     ),
                 )
 

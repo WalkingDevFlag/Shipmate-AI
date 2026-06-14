@@ -25,12 +25,15 @@ class ArchitectureRisk(BaseModel):
     risk: str
     impact: str   # "critical" | "high" | "medium" | "low"
     category: str  # "structure" | "deps" | "config" | "ci_cd" | "security" | "docs"
+    evidence: Optional[str] = None   # file path or pattern that grounds this risk
+    confidence: str = "high"         # "high" | "medium" | "low"
 
 
 class RepoLensOutput(BaseModel):
     tech_stack: List[str]
     primary_language: str
-    architecture_pattern: str   # "monolith" | "monorepo" | "microservices" | "library" | "unknown"
+    # "monolith" | "monorepo" | "microservices" | "fullstack" | "frontend" | "backend" | "library" | "unknown"
+    architecture_pattern: str
     key_modules: List[str]
     entry_points: List[str]
     config_files: List[str]
@@ -271,3 +274,30 @@ class BuildExecuteResponse(BaseModel):
     # Durable BuildRun id — poll GET /api/build/runs/{run_id} for live/terminal
     # state independent of this request (a crash mid-build leaves the record).
     run_id: Optional[str] = None
+
+
+class ResearchFinding(BaseModel):
+    """One grounded codebase-research finding — a loop/hole/tweak/dataflow issue
+    the research pass surfaced, anchored to a real file (and, where relevant, a
+    reference-graph signal)."""
+    title: str
+    kind: str = "observation"                  # dataflow | dead_code | coupling | risk | observation
+    severity: str = "medium"                   # high | medium | low
+    detail: str                                # what it is, concretely, for THIS repo
+    evidence: List[str] = []                   # real file paths / constructs that prove it
+    suggested_action: str = ""                 # one concrete next step (not a full plan)
+    graph_signal: str = ""                     # which graph signal backs it (e.g. "fan_in=11", "cycle", "unreferenced export")
+
+
+class ResearchReport(BaseModel):
+    """Response of POST /api/research — answers a codebase question and/or
+    surfaces dataflow-cleanup targets, grounded on the reference graph."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    question: str = ""                         # the asked question ("" = open audit)
+    answer: str = ""                           # narrative answer (when a question was asked)
+    findings: List[ResearchFinding] = []
+    graph_summary: dict = {}                   # reference_graph.to_summary() — the grounding
+    ai_enhanced: bool = True
+    generated_at: str = ""

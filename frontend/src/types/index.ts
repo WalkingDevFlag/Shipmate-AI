@@ -182,6 +182,20 @@ export interface AgentOutputs {
   testpilot: TestPilotOutput;
 }
 
+/** Optional PR-scoped risk summary. Populated only when the backend runs a
+ *  PR-Risk pass (absent on this build), so it's always optional here — the PDF
+ *  export reads it defensively and omits the section when undefined. */
+export interface PRRiskOutput {
+  pr_number: number;
+  title: string;
+  risk_level: string;   // "critical" | "high" | "medium" | "low"
+  risk_score: number;
+  summary: string;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+}
+
 export interface ShipMateReport {
   repo: RepoInfo;
   readiness_score: number;
@@ -195,6 +209,8 @@ export interface ShipMateReport {
    *  unavailable) — the UI shows a heuristic-only banner. Optional for
    *  back-compat with older payloads. */
   ai_enhanced?: boolean;
+  /** Present only for a PR-scoped analysis; used by the PDF export. */
+  pr_risk?: PRRiskOutput | null;
 }
 
 export interface AnalyzeResponse {
@@ -306,6 +322,48 @@ export interface AutoFixEvent {
   skipped?: number;
   actuated?: number;
   note?: string;
+  message?: string;
+}
+
+// ── Research harness (Research tab, SSE) ─────────────────────────────────────────
+
+export interface ResearchEvent {
+  event:
+    | 'research.start' | 'index.done' | 'graph.done' | 'finding'
+    | 'research.done' | 'propose.start' | 'opportunity' | 'propose.done'
+    | 'done' | 'error';
+  mode?: string;
+  files?: number;
+  // graph.done
+  modules?: number;
+  cycles?: number;
+  god_modules?: number;
+  orphans?: number;
+  // finding
+  title?: string;
+  kind?: string;
+  severity?: string;
+  detail?: string;
+  evidence?: string[];
+  suggested_action?: string;
+  graph_signal?: string;
+  // research.done
+  answer?: string;
+  finding_count?: number;
+  ai_enhanced?: boolean;
+  // opportunity
+  id?: string;
+  category?: string;
+  impact?: string;
+  effort?: string;
+  value_score?: number;
+  priority?: string;
+  target_files?: string[];
+  rationale?: string;
+  // done / propose.done
+  findings?: number;
+  opportunities?: number;
+  count?: number;
   message?: string;
 }
 

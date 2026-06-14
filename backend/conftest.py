@@ -1,11 +1,21 @@
 import sys
 import os
+import pytest
 
 import pytest
 
 # Ensure the backend/ directory is on sys.path so `from app.xxx import ...`
 # works regardless of how pytest is invoked (locally or in CI).
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Disable per-IP rate limiting for the suite. The limiter middleware is now
+# actually mounted (it used to be dead code), and TestClient/AsyncClient calls
+# all share the loopback IP — so a burst across unrelated tests would otherwise
+# accumulate into a spurious 429. Set BEFORE app.main is imported so the flag is
+# in os.environ when the middleware first reads it. The limiter's real behaviour
+# (429 + Retry-After) is covered explicitly in test_rate_limiter_hardening.py,
+# which re-enables it for its own assertions.
+os.environ.setdefault("SHIPMATE_RATE_LIMIT", "0")
 
 
 # Pin anyio-marked async tests to the asyncio backend ONLY.

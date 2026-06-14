@@ -165,6 +165,23 @@ _RESOLVED_PROOFS = (
     (("webhook signature not verified", "unverified webhook", "webhook not authenticated",
       "no webhook signature"),
      _re2.compile(r"_verify_github_webhook_signature|x-hub-signature|hmac\.compare_digest", _re2.IGNORECASE)),
+    # rate-limiter trusts spoofable X-Forwarded-For: refuted once the proxy-trust
+    # gate exists (XFF only honored behind a configured trusted proxy; otherwise
+    # the unspoofable socket peer is used). This is the recurring analyze-side
+    # false positive both Bedrock and Azure surfaced — the defense lives deep in
+    # main.py, outside the truncated LLM blob, so the deterministic proof catches
+    # it before the (now full-file-aware) critic even runs.
+    #
+    # Trigger phrases are deliberately XFF-SPECIFIC (review: over-broad phrases
+    # like bare "proxy header" / "spoofable" could suppress an UNRELATED real
+    # finding that merely mentions proxies). Every phrase here names the
+    # X-Forwarded-For mechanism explicitly, so a collision with a different
+    # genuine finding is implausible. The proof regex still gates it.
+    (("x-forwarded-for", "forwarded-for", "x_forwarded_for", "xff header",
+      "spoofable x-forward", "spoofed x-forward", "rate limiter trusts x-forward",
+      "rate-limiter trusts x-forward", "client ip from the x-forward",
+      "ip from x-forwarded", "trusts the x-forwarded"),
+     _re2.compile(r"_TRUST_PROXY_HEADERS|_get_client_ip|trust_proxy_headers", _re2.IGNORECASE)),
 )
 
 
@@ -174,6 +191,81 @@ def _corpus_blob(file_tree: List[Any], key_files: dict) -> str:
     parts: List[str] = list(file_tree or [])
     parts.extend((key_files or {}).values())
     return "\n".join(p for p in parts if p).lower()
+
+
+def finding_aware_code_blob(
+    findings: List[Any],
+    key_files: dict,
+    *,
+    max_cited_files: int = 4,
+    max_chars_per_cited: int = 14000,
+    fallback_blob: str = "",
+) -> str:
+    """Build a critic code blob that includes the FULL content of the files the
+    findings CITE — not the truncated top-N blob.
+
+    Why this exists (the critic's blindfold): the discovery LLM blob is
+    MAP-FIRST + budget-filled — it carries a symbol map of every file but only
+    the top-scored file BODIES, so a cited file can land in the name-only
+    overflow list with just its symbols shown. A defensive control often lives
+    in the body of such a file (e.g. main.py's `_TRUST_PROXY_HEADERS` /
+    `_get_client_ip` gate), so the critic would see the symbol name but not the
+    implementation it's supposed to credit — and conservatively keeps the false
+    positive. By pulling the full body of each CITED file (capped, and capped in
+    count) we guarantee the control's actual code is in the critic's view. This
+    is the verification-DEPTH half; the discovery blob is the breadth half.
+
+    Returns `fallback_blob` (the old truncated blob) PLUS the cited-file
+    sections, so the critic keeps broad context AND gets the specific files in
+    full. Fail-open: any error returns fallback_blob unchanged."""
+    try:
+        cited: List[str] = []
+        seen: set = set()
+        for f in findings or []:
+            path = getattr(f, "file", None) or getattr(f, "target_file", None)
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            cited.append(path)
+            if len(cited) >= max_cited_files:
+                break
+        if not cited:
+            return fallback_blob
+
+        # key_files stores both filename-keyed and path-keyed entries; match a
+        # cited path against either (suffix match handles 'main.py' vs
+        # 'backend/app/main.py').
+        def _lookup(path: str) -> Optional[str]:
+            kf = key_files or {}
+            if path in kf and kf[path]:
+                return kf[path]
+            # Suffix match ONLY on a path boundary, so cited 'main.py' matches
+            # 'backend/app/main.py' but NOT 'banana_main.py' / 'domain.py'
+            # (review: a bare endswith could attach the wrong file's content).
+            for k, v in kf.items():
+                if not v:
+                    continue
+                if k.endswith("/" + path) or path.endswith("/" + k) or k == path:
+                    return v
+            return None
+
+        sections: List[str] = []
+        for path in cited:
+            content = _lookup(path)
+            if not content:
+                continue
+            body = content[:max_chars_per_cited]
+            trunc = "" if len(content) <= max_chars_per_cited else \
+                f"\n... [truncated; {len(content) - max_chars_per_cited} more chars]"
+            sections.append(f"\n### [FULL] `{path}`\n```\n{body}{trunc}\n```")
+
+        if not sections:
+            return fallback_blob
+        header = "\n## Full content of cited files (defenses may live deep in these)\n"
+        return (fallback_blob + header + "\n".join(sections)) if fallback_blob else (header + "\n".join(sections))
+    except Exception as e:  # pragma: no cover - fail-open
+        logger.debug("finding_aware_code_blob failed (%s); using fallback", e)
+        return fallback_blob
 
 
 def filter_already_resolved(

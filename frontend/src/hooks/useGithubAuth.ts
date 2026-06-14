@@ -29,8 +29,9 @@ export function useGithubAuth() {
       setState(s => ({ ...s, loading: false }));
     }
 
-    // Listen for OAuth popup result
+    // Listen for OAuth popup result — only accept messages from the same origin
     const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
       if (e.data?.type === 'GITHUB_AUTH_SUCCESS') {
         const { access_token, user } = e.data;
         localStorage.setItem('github_access_token', access_token);

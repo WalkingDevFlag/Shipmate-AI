@@ -33,6 +33,13 @@ Public API (called by coder_orchestrator._lint_coder_output):
       orchestrator treats unparseable Coder output as a fatal lint issue —
       no point shipping a .py that won't even import.
 
+  module_exports(content) -> Set[str]
+      Top-level symbols a module exposes (functions, classes, module-level
+      assignments, re-exports). The single source of truth shared by the
+      stale-named-import detector (cure) AND repo_map (prevention) — so what
+      repo_map advertises as importable can never disagree with what lint
+      will accept.
+
 All functions are pure (no IO) so they're trivially unit-testable.
 """
 from __future__ import annotations
@@ -162,10 +169,13 @@ def _collect_imports(content: str) -> Tuple[_ImportCollector, Optional[str]]:
 
 # ── Symbol definitions (for stale-named-import detection) ───────────────────
 
-def _defined_top_level_names(content: str) -> Set[str]:
+def module_exports(content: str) -> Set[str]:
     """Names a module exposes at top level: functions, classes, and
     module-level assignments (incl. annotated assignments and `__all__`-style
-    tuples). Used to verify `from module import name` actually resolves.
+    tuples). Used to verify `from module import name` actually resolves AND to
+    advertise a module's importable symbols in the Coder repo map — one source
+    of truth so prevention (repo_map) and cure (stale-import lint) never
+    disagree on what a module exports.
 
     Returns an empty set on SyntaxError — caller will have already flagged
     the syntax error separately, and an empty set means we won't add MORE
@@ -310,7 +320,7 @@ def detect_stale_named_imports(
         target_src = by_module.get(module)
         if target_src is None:
             continue  # not a module we can see — out of scope
-        defined = _defined_top_level_names(target_src)
+        defined = module_exports(target_src)
         for name in sorted(names):
             if name not in defined:
                 suspect.append(f"{name} from {module}")

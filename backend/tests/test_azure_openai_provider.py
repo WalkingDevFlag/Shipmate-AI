@@ -5,8 +5,8 @@ patch `_call_chat` (the single forced-tool-call round-trip), exactly mirroring
 test_bedrock_retry_triggers.py so the two providers stay behaviourally aligned.
 
 Covers:
-  • Factory selection: default=bedrock, SHIPMATE_LLM_PROVIDER wins over legacy
-    LLM_PROVIDER, invalid value falls back to bedrock, reset clears the cache.
+  • Factory selection: default=azure, SHIPMATE_LLM_PROVIDER wins over legacy
+    LLM_PROVIDER, invalid value falls back to azure, reset clears the cache.
   • Provider contract parity: short-summary retry, lint-feedback re-prompt,
     validation-error retry, deployment_hint -> smart/fast deployment routing.
 """
@@ -42,10 +42,17 @@ def _coder_payload(summary: str):
 # ── Factory ──────────────────────────────────────────────────────────────────
 
 class TestFactorySelection:
-    def test_default_is_bedrock(self, monkeypatch):
+    def test_default_is_azure(self, monkeypatch):
         from app.services import llm_provider
         monkeypatch.delenv("SHIPMATE_LLM_PROVIDER", raising=False)
         monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        assert llm_provider.provider_kind() == "azure"
+
+    def test_legacy_bedrock_still_selectable(self, monkeypatch):
+        # Bedrock remains an explicit opt-in even though azure is now default.
+        from app.services import llm_provider
+        monkeypatch.delenv("SHIPMATE_LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("LLM_PROVIDER", "bedrock")
         assert llm_provider.provider_kind() == "bedrock"
 
     def test_legacy_llm_provider_honoured(self, monkeypatch):
@@ -60,10 +67,10 @@ class TestFactorySelection:
         monkeypatch.setenv("LLM_PROVIDER", "bedrock")
         assert llm_provider.provider_kind() == "azure"
 
-    def test_invalid_value_falls_back_to_bedrock(self, monkeypatch):
+    def test_invalid_value_falls_back_to_azure(self, monkeypatch):
         from app.services import llm_provider
         monkeypatch.setenv("SHIPMATE_LLM_PROVIDER", "gpt5pro")
-        assert llm_provider.provider_kind() == "bedrock"
+        assert llm_provider.provider_kind() == "azure"
 
     def test_reset_clears_cache(self, monkeypatch):
         from app.services import llm_provider

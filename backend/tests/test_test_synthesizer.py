@@ -123,6 +123,58 @@ class TestVerificationBranches:
         assert "coder failed" in res.reason
 
 
+class TestEvalOpsSignal:
+    """Phase 5: the accept/reject signal generalizes from coverage-delta to a
+    pluggable EvalOps spec. A test that passes coverage but FAILS the spec is
+    rejected; one that passes both is accepted."""
+
+    def _report(self, passed):
+        from app.services.eval_schemas import EvalReport, ScenarioResult
+        return EvalReport(
+            spec_name="s", passed=passed,
+            scenarios=[ScenarioResult(name="health", passed=passed,
+                                      failures=[] if passed else ["status 500, expected 200"])],
+        )
+
+    def test_eval_pass_accepts(self, monkeypatch):
+        from app.services.eval_schemas import ValidationSpec
+        _stub_delta(monkeypatch, before_pass=100, after_pass=101,
+                    cov_before=60.0, cov_after=61.0)
+        res = ts.synthesize_and_verify(
+            _suggestion(), _coder_returns("backend/tests/test_x.py"),
+            eval_spec=ValidationSpec(name="s"),
+            eval_fn=lambda spec, files: self._report(True),
+        )
+        assert res.accepted is True
+
+    def test_eval_fail_rejects_even_with_coverage(self, monkeypatch):
+        from app.services.eval_schemas import ValidationSpec
+        # Coverage signal is GREEN, but the EvalOps spec fails → reject.
+        _stub_delta(monkeypatch, before_pass=100, after_pass=101,
+                    cov_before=60.0, cov_after=61.0)
+        res = ts.synthesize_and_verify(
+            _suggestion(), _coder_returns("backend/tests/test_x.py"),
+            eval_spec=ValidationSpec(name="s"),
+            eval_fn=lambda spec, files: self._report(False),
+        )
+        assert res.accepted is False
+        assert "EvalOps spec FAILED" in res.reason
+        assert "status 500" in res.reason
+
+    def test_eval_fn_error_is_no_signal_not_reject(self, monkeypatch):
+        from app.services.eval_schemas import ValidationSpec
+        # eval_fn raising must not flip a coverage-accepted test to rejected.
+        _stub_delta(monkeypatch, before_pass=100, after_pass=101,
+                    cov_before=60.0, cov_after=61.0)
+        def boom(spec, files):
+            raise RuntimeError("eval boot failed")
+        res = ts.synthesize_and_verify(
+            _suggestion(), _coder_returns("backend/tests/test_x.py"),
+            eval_spec=ValidationSpec(name="s"), eval_fn=boom,
+        )
+        assert res.accepted is True  # eval couldn't run → fall back to coverage verdict
+
+
 class TestSynthesizeTop:
     def test_stops_at_first_accepted(self, monkeypatch):
         _stub_delta(monkeypatch, before_pass=100, after_pass=101,

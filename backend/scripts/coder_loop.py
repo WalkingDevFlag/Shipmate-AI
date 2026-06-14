@@ -47,6 +47,7 @@ from app.services.coder_orchestrator import (
     _resolve_target_paths,
     _fetch_current_contents,
     _build_task,
+    _build_repo_map,
     _deployment_hint,
     _lint_coder_output,
 )
@@ -451,9 +452,11 @@ async def _actuate_one(
             tech_stack=ctx.tech_stack,
             entry_points=ctx.entry_points,
             target_files=target_files,
+            repo_map=_build_repo_map(file_tree, target_files, target_paths),
             finding_kind=finding.kind,
             finding_id=finding.id,
             finding_severity=finding.severity,
+            finding_category=getattr(finding, "category", "") or "",
         )
         agent = CoderAgent()
         _mode = "diff" if diff_mode else "full"

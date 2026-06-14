@@ -17,13 +17,13 @@ import pytest
 # (module to import, why it's required). Each must be importable in the same
 # environment that `pip install -r requirements.txt` produces.
 _REQUIRED_RUNTIME_MODULES = [
-    ("boto3", "Bedrock provider (default LLM) — bedrock_provider.py Converse calls"),
+    ("openai", "Azure OpenAI provider (default LLM) — azure_openai_provider.py"),
+    ("boto3", "Bedrock provider (optional, LLM_PROVIDER=bedrock) — Converse calls"),
     ("botocore", "boto3 transitive — Config/exceptions used by bedrock_provider"),
     ("fastapi", "web framework"),
     ("uvicorn", "ASGI server"),
     ("httpx", "GitHub API client"),
     ("pydantic", "schemas"),
-    ("openai", "Azure OpenAI provider (SHIPMATE_LLM_PROVIDER=azure)"),
     ("dotenv", "python-dotenv — .env loading in main.py"),
 ]
 

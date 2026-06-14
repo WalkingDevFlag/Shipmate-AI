@@ -23,8 +23,7 @@ from app.schemas.agent_schemas import BuildPlanResponse, BuildExecuteResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.services.repo_index_service import RepoIndexService
 from app.services.opportunity_service import OpportunityService
-from app.api.routes.analysis import _verify_repo_write_access
-from app.api.deps import require_body_credential
+from app.api.deps import require_body_credential, verify_repo_write_access
 
 router = APIRouter(tags=["build"])
 logger = logging.getLogger("shipmate.build_route")
@@ -37,9 +36,7 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
     request.access_token = require_body_credential(request.access_token)
 
     # Authorization: write access required, mirroring /analyze.
-    await _verify_repo_write_access(
-        token=request.access_token, owner=request.owner, repo=request.repo,
-    )
+    await verify_repo_write_access(request.owner, request.repo, request.access_token)
 
     try:
         # One front door: build_context + enrich + RepoLens, cached per
@@ -58,6 +55,16 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
         )
 
     try:
+        # mode="innovation" routes to the blue-sky pipeline (discover_innovations
+        # + innovation_critic); default mode="opportunity" is the conservative
+        # product-review pipeline. Same context, same ranker/journal.
+        if (request.mode or "").strip().lower() == "innovation":
+            return OpportunityService.build_innovation_plan(
+                repo_context,
+                max_opportunities=request.max_opportunities,
+                include_ungrounded=request.include_ungrounded,
+                repo_lens=index.repo_lens,
+            )
         return OpportunityService.build_plan(
             repo_context,
             max_opportunities=request.max_opportunities,
@@ -81,9 +88,7 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
     request.access_token = require_body_credential(request.access_token)
 
-    await _verify_repo_write_access(
-        token=request.access_token, owner=request.owner, repo=request.repo,
-    )
+    await verify_repo_write_access(request.owner, request.repo, request.access_token)
 
     try:
         # Single front door — build_context + enrich + RepoLens, cached. This

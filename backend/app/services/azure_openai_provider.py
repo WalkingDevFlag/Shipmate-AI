@@ -18,9 +18,9 @@ Why function-calling with tool_choice (vs response_format / "give me JSON"):
   • The openai SDK is sync; we wrap calls with `asyncio.to_thread` exactly like
     BedrockProvider does, so multi-agent fan-out stays non-blocking.
 
-Auth: API key + endpoint from env (no ADA / no credential rollover — this is
-the path used when hosted on Azure, where there's no `ada credentials update`).
-Selected by the factory in `llm_provider.py` when SHIPMATE_LLM_PROVIDER=azure.
+Auth: API key + endpoint from env (no credential rollover — this is the
+default, hosted production path on Azure). Selected by the factory in
+`llm_provider.py` when SHIPMATE_LLM_PROVIDER=azure (the default).
 
 Env keys:
   AZURE_OPENAI_ENDPOINT          https://<resource>.openai.azure.com/

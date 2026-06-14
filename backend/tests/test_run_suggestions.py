@@ -191,7 +191,7 @@ class TestBuildPlan502:
         from app.services.repo_analysis_service import RepoAnalysisService
 
         async def ok_auth(token, owner, repo): return None
-        monkeypatch.setattr(build_mod, "_verify_repo_write_access", ok_auth)
+        monkeypatch.setattr(build_mod, "verify_repo_write_access", ok_auth)
 
         async def boom(*a, **k):
             raise RuntimeError("github exploded")

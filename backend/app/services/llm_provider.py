@@ -1,13 +1,13 @@
 """
-LLM provider factory — the single switch between Bedrock and Azure OpenAI.
+LLM provider factory — the single switch between Azure OpenAI and Bedrock.
 
 ShipMate's agents (coder, decomposer) and LLMService all need a structured-
 output LLM client. There are two interchangeable implementations:
 
-  • BedrockProvider      — AWS Bedrock Converse API (local dev / demo; creds
-                           come from `ada credentials update`).
-  • AzureOpenAIProvider  — Azure OpenAI tool-calling (hosted on Azure, where
-                           there's no ADA to refresh Bedrock creds).
+  • AzureOpenAIProvider  — Azure OpenAI tool-calling. The default, hosted
+                           production path (Azure AI Foundry deployment).
+  • BedrockProvider      — AWS Bedrock Converse API. Optional alternative
+                           backend (standard boto3 credential provider chain).
 
 Both expose the IDENTICAL contract:
     invoke_structured_sync(system_prompt, user_prompt, schema_class, deployment_hint) -> BaseModel
@@ -15,16 +15,16 @@ Both expose the IDENTICAL contract:
     invoke_with_lint_feedback(...)    (coder retry path)
 
 Selection is one env var, `SHIPMATE_LLM_PROVIDER`:
-    - "bedrock" (default)  → BedrockProvider
-    - "azure"              → AzureOpenAIProvider
+    - "azure" (default)  → AzureOpenAIProvider
+    - "bedrock"          → BedrockProvider
 
-So the SAME codebase runs on Bedrock locally (flip nothing, record the demo)
-and on Azure when hosted (set SHIPMATE_LLM_PROVIDER=azure + the Azure env
-keys). No code changes to switch — just the flag.
+So the SAME codebase runs on Azure OpenAI by default and can fall back to
+Bedrock by setting SHIPMATE_LLM_PROVIDER=bedrock + AWS creds. No code changes
+to switch — just the flag.
 
 The provider is built once and cached per process. `reset_provider()` clears
 the cache (used on transient auth failures so the next call rebuilds the
-client with refreshed creds — Bedrock's ADA-rollover recovery).
+client with refreshed credentials without a process restart).
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ _provider_kind: Optional[str] = None
 
 
 def provider_kind() -> str:
-    """The configured provider name (lowercased), defaulting to bedrock.
+    """The configured provider name (lowercased), defaulting to azure.
 
     SHIPMATE_LLM_PROVIDER is the canonical key. We also honour the older
     LLM_PROVIDER key (llm_service used it) so existing .env files keep working;
@@ -52,9 +52,9 @@ def provider_kind() -> str:
     kind = (
         os.getenv("SHIPMATE_LLM_PROVIDER")
         or os.getenv("LLM_PROVIDER")
-        or _BEDROCK
+        or _AZURE
     ).strip().lower()
-    return kind if kind in (_BEDROCK, _AZURE) else _BEDROCK
+    return kind if kind in (_BEDROCK, _AZURE) else _AZURE
 
 
 def get_provider() -> Any:

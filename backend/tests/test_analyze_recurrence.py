@@ -253,7 +253,7 @@ def test_analyze_raises_502_when_repo_index_service_throws(monkeypatch):
     # Write-access check passes; the index build is what blows up.
     async def ok_auth(token, owner, repo):
         return None
-    monkeypatch.setattr(analysis_mod, "_verify_repo_write_access", ok_auth)
+    monkeypatch.setattr(analysis_mod, "verify_repo_write_access", ok_auth)
 
     async def boom(*a, **k):
         raise RuntimeError("github exploded")

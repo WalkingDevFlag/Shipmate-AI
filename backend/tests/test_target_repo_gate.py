@@ -13,6 +13,7 @@ import os
 import pytest
 
 from app.services import validation_gate as vg
+from app.services import sandbox
 
 
 # ── detect_test_command ──────────────────────────────────────────────────────
@@ -65,6 +66,25 @@ def test_stripped_env_omits_secrets(monkeypatch):
     # PATH must survive so the test runner can be found.
     assert "PATH" in env
     assert env.get("SHIPMATE_SANDBOX") == "1"
+
+
+def test_stripped_env_preserves_loader_paths(monkeypatch):
+    """Regression: the dynamic-loader search paths must survive the strip.
+
+    GitHub's setup-python toolcache interpreter is dynamically linked against
+    libpython in …/x64/lib and CANNOT START without LD_LIBRARY_PATH. Stripping
+    it made the target-repo gate's nested `python -m pytest` exit 127 (loader
+    failure) on the Linux CI runner — before pytest ran — while passing on
+    macOS. These are our own interpreter's lib paths, not secrets, so they must
+    be inherited."""
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hostedtoolcache/Python/3.11/x64/lib")
+    monkeypatch.setenv("DYLD_LIBRARY_PATH", "/usr/local/lib")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "supersecret")  # still a secret
+    env = vg._stripped_env()
+    assert env.get("LD_LIBRARY_PATH") == "/opt/hostedtoolcache/Python/3.11/x64/lib"
+    assert env.get("DYLD_LIBRARY_PATH") == "/usr/local/lib"
+    # …but the strip still drops real secrets.
+    assert "GITHUB_CLIENT_SECRET" not in env
 
 
 # ── flag gating ──────────────────────────────────────────────────────────────
@@ -135,21 +155,36 @@ def test_apply_files_rejects_traversal(tmp_path):
 def test_runs_detected_pytest_in_clone(monkeypatch, tmp_path):
     """Patch the clone step to populate the workdir with a tiny passing pytest
     suite, then let the real detect+run path execute. Proves the gate runs the
-    TARGET repo's tests and parses the result."""
+    TARGET repo's tests and parses the result.
+
+    docker is absent on CI/dev, so the gate now FAILS CLOSED unless the operator
+    opts into the unsandboxed host path — set that flag here (this test asserts
+    the run+parse mechanics, not the sandbox policy)."""
     monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
+    monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # This test exercises the run+parse MECHANICS on the host path (the backend
+    # venv has pytest). Pin docker OFF so it deterministically takes that path —
+    # on a docker-equipped runner (GitHub) the gate would otherwise launch the
+    # suite inside python:3.x-slim, which has no pytest installed.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
 
     import subprocess
     real_run = subprocess.run
 
     def fake_run(cmd, *a, **k):
+        # cmd is argv; the clone is `git clone ... <workdir>` where workdir ends in /repo.
         if cmd[:2] == ["git", "clone"]:
-            # cmd[-1] is the workdir git would have created; materialize a repo
-            # with a tests/ dir so detect_test_command fires the pytest path.
             workdir = cmd[-1]
             os.makedirs(os.path.join(workdir, "tests"), exist_ok=True)
             with open(os.path.join(workdir, "tests", "test_smoke.py"), "w") as f:
                 f.write("def test_ok():\n    assert 1 + 1 == 2\n")
 
+            class _OK:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _OK()
+        if cmd[:3] == ["git", "remote", "set-url"] or cmd[:2] == ["git", "-C"] and "set-url" in cmd:
             class _OK:
                 returncode = 0
                 stdout = ""
@@ -169,6 +204,10 @@ def test_runs_detected_pytest_in_clone(monkeypatch, tmp_path):
 
 def test_failing_target_tests_reject_the_patch(monkeypatch):
     monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
+    monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # Host path (backend venv has pytest); pin docker OFF — see the note in
+    # test_runs_detected_pytest_in_clone.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
 
     import subprocess
     real_run = subprocess.run
@@ -185,6 +224,12 @@ def test_failing_target_tests_reject_the_patch(monkeypatch):
                 stdout = ""
                 stderr = ""
             return _OK()
+        if "set-url" in cmd:
+            class _OK:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _OK()
         return real_run(cmd, *a, **k)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -194,3 +239,93 @@ def test_failing_target_tests_reject_the_patch(monkeypatch):
     assert res.passed is False
     assert res.failed >= 1
     assert "failed" in res.reason
+
+
+def test_clone_credential_scrubbed_before_running_suite(monkeypatch):
+    """Review finding #4: the tokened clone URL git persists into .git/config
+    must be scrubbed (remote set-url to the tokenless URL) BEFORE the untrusted
+    suite runs, so the suite can't lift the bearer token from disk."""
+    monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
+    monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # Host path (backend venv has pytest); pin docker OFF — see the note in
+    # test_runs_detected_pytest_in_clone.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
+
+    import subprocess
+    real_run = subprocess.run
+    seen = {"scrub_before_tests": False, "tests_ran": False}
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["git", "clone"]:
+            workdir = cmd[-1]
+            os.makedirs(os.path.join(workdir, "tests"), exist_ok=True)
+            with open(os.path.join(workdir, "tests", "test_ok.py"), "w") as f:
+                f.write("def test_ok():\n    assert True\n")
+
+            class _OK:
+                returncode = 0; stdout = ""; stderr = ""
+            return _OK()
+        if "set-url" in cmd:
+            # The scrub rewrites origin to the tokenless URL.
+            assert "https://github.com/o/r.git" in cmd
+            assert not any("x-access-token" in str(c) for c in cmd)
+            if not seen["tests_ran"]:
+                seen["scrub_before_tests"] = True
+
+            class _OK:
+                returncode = 0; stdout = ""; stderr = ""
+            return _OK()
+        if "pytest" in cmd:
+            seen["tests_ran"] = True
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    res = vg.gate_patch_target_repo(
+        "o", "r", "main", [{"path": "app/x.py", "new_content": "X=1\n"}],
+        access_token="ghp_SEKRET",
+    )
+    assert seen["scrub_before_tests"] is True, "credential must be scrubbed before tests run"
+    assert "ghp_SEKRET" not in (res.summary_tail or "")
+
+
+def test_fails_closed_without_docker_or_opt_in(monkeypatch):
+    """The security fix: with docker absent and no explicit opt-in, the gate must
+    NOT execute the untrusted suite on the host. It returns a non-blocking pass
+    (PR ships unvalidated, pre-Phase-2 behaviour) WITHOUT running clone code."""
+    monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
+    monkeypatch.delenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", raising=False)
+
+    import subprocess
+    from app.services import sandbox
+    sandbox.reset_docker_cache()
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)  # no docker
+
+    real_run = subprocess.run
+    ran_tests = {"pytest": False}
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["git", "clone"]:
+            workdir = cmd[-1]
+            os.makedirs(os.path.join(workdir, "tests"), exist_ok=True)
+            with open(os.path.join(workdir, "tests", "test_x.py"), "w") as f:
+                f.write("def test_ok():\n    assert True\n")
+
+            class _OK:
+                returncode = 0; stdout = ""; stderr = ""
+            return _OK()
+        if "pytest" in cmd:
+            ran_tests["pytest"] = True
+        if "set-url" in cmd:
+            class _OK:
+                returncode = 0; stdout = ""; stderr = ""
+            return _OK()
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    res = vg.gate_patch_target_repo(
+        "o", "r", "main", [{"path": "app/x.py", "new_content": "X=1\n"}],
+    )
+    sandbox.reset_docker_cache()
+    assert ran_tests["pytest"] is False, "untrusted suite must NOT run on host without isolation"
+    assert "docker unavailable" in res.reason
+    assert res.passed is True  # fail-open verdict, but no code executed

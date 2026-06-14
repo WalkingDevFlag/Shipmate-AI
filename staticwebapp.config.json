@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/staticwebapp.config.json",
+  "//": "Azure Static Web Apps routing for the ShipMate frontend (feat/azure-deploy). The SPA keeps VITE_API_BASE at its '/api' default and SWA proxies /api/* to the backend Container App, so no API host is baked into the bundle. Set BACKEND_ORIGIN below to the deployed backend URL (e.g. https://shipmate-api.<region>.azurecontainerapps.io). Everything else falls through to index.html for client-side routing (incl. the /github/callback OAuth route).",
+  "routes": [
+    {
+      "route": "/api/*",
+      "rewrite": "https://BACKEND_ORIGIN/api/*"
+    }
+  ],
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": ["/assets/*", "/*.{css,js,png,jpg,jpeg,gif,svg,ico,woff,woff2}"]
+  },
+  "responseOverrides": {
+    "404": {
+      "rewrite": "/index.html",
+      "statusCode": 200
+    }
+  },
+  "globalHeaders": {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer"
+  }
+}

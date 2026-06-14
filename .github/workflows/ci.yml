@@ -9,23 +9,29 @@ name: CI/CD Pipeline
 #                              bandit security. Blocks merge. Uploads JUnit XML
 #                              + coverage as artifacts — CIWatcher consumes the
 #                              JUnit XML to feed STRUCTURED failures back to Coder.
-#   integration-gate (PR +   — docker build + boot smoke (GET /health). No
-#                     main)    registry push, no deploy (quality-only per scope).
+#   integration-gate (PR +   — docker build + boot smoke (GET /health) +
+#                     main)    EvalOps eval-gate (declarative ValidationSpec run
+#                              against the booted app). No registry push, no
+#                              deploy (quality-only per scope).
 #
 # The CIWatcher's collect_failure_context fetches failed-job logs via the
 # Actions API; with junit.xml uploaded it can also pull the parsed test
-# results (test name / file / line / exception) instead of raw stdout.
+# results (test name / file / line / exception) instead of raw stdout. The
+# eval-gate uploads eval-report.json the same way for structured EvalOps
+# failures.
 
 on:
   push:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**
   pull_request:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**
@@ -279,3 +285,47 @@ jobs:
           docker logs shipmate-ci
           docker rm -f shipmate-ci
           exit 1
+
+  eval-gate:
+    name: integration-gate · EvalOps spec
+    runs-on: ubuntu-latest
+    # Same tier prerequisites as docker-smoke — both are integration-gate jobs,
+    # so eval-gate shouldn't run (and possibly red) when an earlier test-gate
+    # job already failed.
+    needs: [backend-test, frontend-lint, bandit-security]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run EvalOps baseline spec against the booted app
+        # Boots the real FastAPI app in-process (TestClient), fires the
+        # ValidationSpec's scenarios, asserts response shape + metrics + clean
+        # logs, writes eval-report.json, and exits non-zero on failure. This is
+        # the EvalOps generalization of "did the artifact move a measurable
+        # signal" — declarative scenarios instead of only a coverage delta.
+        run: |
+          mkdir -p reports
+          PYTHONPATH=. python -m app.services.eval_runner \
+            --spec-file app/evals/baseline.json \
+            --out reports/eval-report.json
+
+      - name: Upload eval report (CIWatcher consumes eval-report.json)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: backend/reports/eval-report.json
+          retention-days: 7

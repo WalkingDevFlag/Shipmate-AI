@@ -22,7 +22,9 @@ feeding back into Coder so we stay under Sonnet's context with headroom
 from __future__ import annotations
 
 import io
+import json
 import logging
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 from typing import Any, Dict, List, Optional
@@ -41,6 +43,84 @@ _TEST_REPORT_ARTIFACT = "backend-test-reports"
 _JUNIT_MEMBER_HINT = "junit.xml"        # member filename inside the artifact zip
 _JUNIT_MAX_FAILURES = 40                # cap structured failures fed to Coder
 _JUNIT_MSG_CHARS = 600                  # truncate each failure message
+
+# The eval-gate uploads structured EvalOps results the same way the test-gate
+# uploads JUnit (see .github/workflows/ci.yml). The watcher consumes both.
+_EVAL_REPORT_ARTIFACT = "eval-report"
+_EVAL_REPORT_MEMBER_HINT = "eval-report.json"
+_EVAL_MAX_FAILURES = 30
+
+# How many failing-source paths we extract from a failure blob and re-fetch
+# into the Coder's context. Small cap: we want the handful of files the
+# failure actually points at, not the whole repo.
+_MAX_FAILING_PATHS = 8
+
+# A repo-relative source path in a traceback / pytest header.
+# Matches: tests/test_x.py, backend/app/foo.py, src/a/b.ts:42, app\\x.py (win)
+_PATH_RE = re.compile(
+    r"""(?:File\s+"|^|\s|\(|')           # boundary: File ", line start, space, ( or '
+        (?P<path>
+            (?:[\w.\-]+[/\\])+            # at least one dir segment
+            [\w.\-]+
+            # longer extensions first — Python re is leftmost-alternation, so
+            # `tsx` must precede `ts` or `App.tsx` truncates to `App.ts`.
+            \.(?:tsx|ts|jsx|js|py|go|rb|java|rs|php|cpp|cc|hpp|h|c)
+        )
+        (?![\w])                          # ext not followed by more word chars
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+# pytest node id header, e.g. "tests/test_x.py::TestA::test_y" or
+# "FAILED tests/test_x.py::test_y - AssertionError".
+_PYTEST_NODE_RE = re.compile(r"(?P<path>(?:[\w.\-]+[/\\])*[\w.\-]+\.py)::")
+
+
+def extract_failing_paths(failure_blob: str) -> List[str]:
+    """Pull the repo-relative source paths a CI failure points at, so the
+    caller can fetch their CURRENT contents and hand them to the Coder as
+    real files to edit (instead of forcing a from-scratch rewrite).
+
+    Pure / network-free → unit-testable offline. Sources, in priority order:
+      1. pytest node ids  (`tests/test_x.py::test_y`)
+      2. traceback / log paths  (`File "app/foo.py", line 12`, `src/a.ts:42`)
+      3. JUnit `classname::name` lines from `_format_junit_failures`, where the
+         classname is a dotted module (`tests.test_x`) → candidate paths.
+
+    Order-preserving + de-duplicated; capped at `_MAX_FAILING_PATHS`. The
+    paths are CANDIDATES — `get_file_content` fails open to None for any that
+    don't resolve, so over-matching is harmless.
+    """
+    if not failure_blob:
+        return []
+
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    def _add(p: str) -> None:
+        p = p.strip().replace("\\", "/")
+        # Strip a trailing :line / :line:col if the regex kept it.
+        p = re.sub(r":\d+(?::\d+)?$", "", p)
+        if p and p not in seen and not p.startswith(("/", "http")):
+            seen.add(p)
+            ordered.append(p)
+
+    # 1. pytest node ids — highest signal (real repo-relative path + ::).
+    for m in _PYTEST_NODE_RE.finditer(failure_blob):
+        _add(m.group("path"))
+
+    # 2. traceback / generic source paths.
+    for m in _PATH_RE.finditer(failure_blob):
+        _add(m.group("path"))
+
+    # 3. JUnit dotted classnames (the `_format_junit_failures` lines look like
+    #    "[FAILURE] tests.test_x::test_y — ..."). Map the dotted module to a
+    #    candidate path. Only fires for first-party `app.`/`backend.`/`tests.`.
+    for m in re.finditer(r"\[(?:FAILURE|ERROR)\]\s+(?P<cls>[\w.]+)::", failure_blob):
+        cls = m.group("cls")
+        if "." in cls and "/" not in cls:
+            _add(cls.replace(".", "/") + ".py")
+
+    return ordered[:_MAX_FAILING_PATHS]
 
 
 def _headers(token: str) -> Dict[str, str]:
@@ -171,6 +251,35 @@ class GitHubActionsService:
                     owner, repo, pr_number, resp.text[:200],
                 )
 
+    @classmethod
+    async def rerun_failed_jobs(
+        cls, token: str, owner: str, repo: str, head_sha: str,
+    ) -> bool:
+        """Re-run only the failed jobs of the workflow run at *head_sha* (used
+        by the flaky-vs-real guard: a transient failure that passes on rerun
+        shouldn't burn a Coder fix attempt). Returns True if the rerun was
+        accepted. Best-effort — never raises into the watch loop."""
+        try:
+            run_id = await cls._find_workflow_run_id(token, owner, repo, head_sha)
+            if run_id is None:
+                return False
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+                    headers=_headers(token),
+                )
+                # 201 Created on success; 403 if re-run not permitted on this run.
+                if resp.status_code >= 400:
+                    logger.info(
+                        "rerun_failed_jobs HTTP %s for run %s: %s",
+                        resp.status_code, run_id, resp.text[:200],
+                    )
+                    return False
+                return True
+        except Exception as e:
+            logger.info("rerun_failed_jobs soft-failed: %s", e)
+            return False
+
     # ── Structured test failures (JUnit XML artifact) ───────────────────
 
     @staticmethod
@@ -195,6 +304,38 @@ class GitHubActionsService:
             return runs[0].get("id") if runs else None
 
     @classmethod
+    async def _download_artifact_zip(
+        cls, token: str, owner: str, repo: str, head_sha: str, artifact_name: str,
+    ) -> Optional[bytes]:
+        """Resolve the workflow run at *head_sha*, find the named artifact, and
+        return its zip bytes. None when the run/artifact is absent or expired.
+        Shared by the JUnit and eval-report fetchers."""
+        run_id = await cls._find_workflow_run_id(token, owner, repo, head_sha)
+        if run_id is None:
+            return None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
+            listing = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+                headers=_headers(token),
+            )
+            if listing.status_code >= 400:
+                return None
+            artifacts = listing.json().get("artifacts", [])
+            target = next(
+                (a for a in artifacts if a.get("name") == artifact_name),
+                None,
+            )
+            if target is None or target.get("expired"):
+                return None
+            dl = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/actions/artifacts/{target['id']}/zip",
+                headers=_headers(token),
+            )
+            if dl.status_code >= 400:
+                return None
+            return dl.content
+
+    @classmethod
     async def fetch_junit_failures(
         cls, token: str, owner: str, repo: str, head_sha: str,
     ) -> Optional[str]:
@@ -211,37 +352,37 @@ class GitHubActionsService:
         run failed before upload, or the repo predates the JUnit-emitting CI).
         """
         try:
-            run_id = await cls._find_workflow_run_id(token, owner, repo, head_sha)
-            if run_id is None:
+            zip_bytes = await cls._download_artifact_zip(
+                token, owner, repo, head_sha, _TEST_REPORT_ARTIFACT,
+            )
+            if zip_bytes is None:
                 return None
-
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-                listing = await client.get(
-                    f"{_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-                    headers=_headers(token),
-                )
-                if listing.status_code >= 400:
-                    return None
-                artifacts = listing.json().get("artifacts", [])
-                target = next(
-                    (a for a in artifacts if a.get("name") == _TEST_REPORT_ARTIFACT),
-                    None,
-                )
-                if target is None or target.get("expired"):
-                    return None
-
-                dl = await client.get(
-                    f"{_BASE}/repos/{owner}/{repo}/actions/artifacts/"
-                    f"{target['id']}/zip",
-                    headers=_headers(token),
-                )
-                if dl.status_code >= 400:
-                    return None
-                zip_bytes = dl.content
-
             return cls._parse_junit_zip(zip_bytes)
         except Exception as e:  # never let artifact issues break the fix loop
             logger.info("fetch_junit_failures soft-failed: %s", e)
+            return None
+
+    @classmethod
+    async def fetch_eval_failures(
+        cls, token: str, owner: str, repo: str, head_sha: str,
+    ) -> Optional[str]:
+        """
+        Download the `eval-report` artifact (EvalOps integration-gate output)
+        for the run at *head_sha*, parse the JSON, and return a compact list of
+        failing scenarios / unsatisfied metrics. This is the highest-signal
+        failure context for an eval-gate red — scenario X returned 422 not 200,
+        metric Y never fired — far more actionable than raw logs. None when the
+        artifact is absent (most repos / non-eval failures).
+        """
+        try:
+            zip_bytes = await cls._download_artifact_zip(
+                token, owner, repo, head_sha, _EVAL_REPORT_ARTIFACT,
+            )
+            if zip_bytes is None:
+                return None
+            return cls._parse_eval_zip(zip_bytes)
+        except Exception as e:  # never let artifact issues break the fix loop
+            logger.info("fetch_eval_failures soft-failed: %s", e)
             return None
 
     @classmethod
@@ -301,6 +442,69 @@ class GitHubActionsService:
         return "Parsed JUnit test failures (test id — reason):\n" + "\n".join(lines)
 
     @classmethod
+    def _parse_eval_zip(cls, zip_bytes: bytes) -> Optional[str]:
+        """Extract eval-report.json from the artifact zip and format its
+        failures. Pure/synchronous so it's unit-testable without the network."""
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        except zipfile.BadZipFile:
+            return None
+        member = next(
+            (n for n in zf.namelist() if n.endswith(_EVAL_REPORT_MEMBER_HINT)),
+            None,
+        )
+        if member is None:
+            return None
+        return cls._format_eval_failures(zf.read(member))
+
+    @classmethod
+    def _format_eval_failures(cls, json_bytes: bytes) -> Optional[str]:
+        """Turn an eval-report.json into a compact failure list: failing
+        scenarios (with status code + reasons), unsatisfied metrics, and log
+        violations. None if it parses clean / has no failures. Parses the JSON
+        directly (not via the Pydantic model) to stay robust to schema drift,
+        mirroring how _format_junit_failures reads XML directly."""
+        try:
+            report = json.loads(json_bytes)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(report, dict):
+            return None
+
+        lines: List[str] = []
+        top_error = report.get("error")
+        if top_error:
+            lines.append(f"  [EVAL DID NOT RUN] {str(top_error)[:_JUNIT_MSG_CHARS]}")
+
+        for scn in report.get("scenarios", []) or []:
+            if isinstance(scn, dict) and not scn.get("passed", True):
+                name = scn.get("name", "?")
+                code = scn.get("status_code")
+                reasons = "; ".join(str(f) for f in (scn.get("failures") or []))
+                reasons = " ".join(reasons.split())
+                if len(reasons) > _JUNIT_MSG_CHARS:
+                    reasons = reasons[:_JUNIT_MSG_CHARS] + " …[truncated]"
+                code_str = f" (HTTP {code})" if code is not None else ""
+                lines.append(f"  [SCENARIO FAILED] {name}{code_str} — {reasons or 'assertion failed'}")
+            if len(lines) >= _EVAL_MAX_FAILURES:
+                break
+
+        for met in report.get("metrics", []) or []:
+            if isinstance(met, dict) and not met.get("satisfied", True):
+                name = met.get("name", "?")
+                state = "never fired" if not met.get("fired") else "fired unexpectedly"
+                lines.append(f"  [METRIC UNSATISFIED] {name} — {state}")
+            if len(lines) >= _EVAL_MAX_FAILURES:
+                break
+
+        for viol in (report.get("log_violations") or [])[:5]:
+            lines.append(f"  [LOG VIOLATION] {str(viol)[:200]}")
+
+        if not lines:
+            return None
+        return "Parsed EvalOps failures (scenario / metric — reason):\n" + "\n".join(lines)
+
+    @classmethod
     async def collect_failure_context(
         cls, token: str, owner: str, repo: str, status: CheckRunStatus,
         head_sha: Optional[str] = None,
@@ -318,6 +522,13 @@ class GitHubActionsService:
         chunks: List[str] = []
 
         if head_sha:
+            # EvalOps failures first — highest-signal (behavioural: scenario X
+            # returned 422, metric Y never fired). Then JUnit. Then raw logs.
+            eval_fail = await cls.fetch_eval_failures(token, owner, repo, head_sha)
+            if eval_fail:
+                chunks.append("=== EVAL FAILURES ===")
+                chunks.append(eval_fail)
+                chunks.append("")
             junit = await cls.fetch_junit_failures(token, owner, repo, head_sha)
             if junit:
                 chunks.append("=== STRUCTURED TEST FAILURES (JUnit) ===")

@@ -237,7 +237,7 @@ class TestExecuteRoute:
         from app.agents.repo_lens_agent import RepoLensAgent
 
         async def ok_auth(token, owner, repo): return None
-        monkeypatch.setattr(build_mod, "_verify_repo_write_access", ok_auth)
+        monkeypatch.setattr(build_mod, "verify_repo_write_access", ok_auth)
 
         async def fake_ctx(*a, **k):
             return {"repo_info": {"owner": "o", "name": "r", "full_name": "o/r"},

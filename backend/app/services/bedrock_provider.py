@@ -15,10 +15,10 @@ Why Converse + toolConfig (vs InvokeModel + per-model body):
   • boto3-only — no extra deps. The SDK is sync; we wrap calls with
     `asyncio.to_thread` exactly like AzureOpenAIProvider does.
 
-Auth: relies on the standard boto3 credential provider chain. On the
-Pharma-ASIN-Enrich-9 burner account, `ada credentials update` populates
-the default profile at ~/.aws/credentials and boto3 picks it up
-transparently — no AWS_PROFILE env var needed.
+Auth: relies on the standard boto3 credential provider chain — environment
+variables, the shared config file at ~/.aws/credentials, or an instance/role
+profile. boto3 resolves whichever is present transparently; no AWS_PROFILE
+env var is required.
 """
 from __future__ import annotations
 
@@ -39,6 +39,35 @@ from app.services.provider_coercion import (
 )
 
 logger = logging.getLogger("shipmate.bedrock_provider")
+
+
+# Model generations that removed the sampling params (temperature/top_p/top_k):
+# Fable 5 and Opus 4.7+. Passing `temperature` to these via Converse returns a
+# 400 ValidationException. Match against the bare model name inside the
+# inference-profile id (e.g. "us.anthropic.claude-fable-5",
+# "global.anthropic.claude-opus-4-8") so region/profile prefixes don't matter.
+_NO_TEMPERATURE_MODELS = ("claude-fable-5", "claude-opus-4-8", "claude-opus-4-7")
+
+
+def _accepts_temperature(model_id: str) -> bool:
+    """True if the model still accepts an explicit `temperature`. Fable 5 and
+    Opus 4.7/4.8 reject it (400); everything older accepts it."""
+    mid = (model_id or "").lower()
+    return not any(tag in mid for tag in _NO_TEMPERATURE_MODELS)
+
+
+# Models that reject Converse forced tool use (`toolChoice={"tool": ...}`) with
+# a ValidationException. Fable 5 / Mythos 5 require the native structured-output
+# path (`outputConfig.textFormat` + JSON schema) instead, which returns the JSON
+# in a text block rather than a toolUse block.
+_NO_FORCED_TOOL_USE_MODELS = ("claude-fable-5", "claude-mythos-5")
+
+
+def _supports_forced_tool_use(model_id: str) -> bool:
+    """True if the model supports `toolChoice={"tool": ...}` to force structured
+    output. Fable 5 / Mythos 5 do not — use native structured outputs there."""
+    mid = (model_id or "").lower()
+    return not any(tag in mid for tag in _NO_FORCED_TOOL_USE_MODELS)
 
 
 class BedrockProvider:
@@ -288,13 +317,30 @@ class BedrockProvider:
         max_tokens: int,
     ) -> dict[str, Any]:
         def _call() -> dict[str, Any]:
+            # Fable 5 and Opus 4.7/4.8 removed the sampling params — passing
+            # `temperature` returns a 400 (ValidationException). Omit it for
+            # those generations; keep the deterministic 0.2 on models that
+            # still accept it (Sonnet 4.6, Haiku 4.5, Opus ≤4.6).
+            inference_config: dict[str, Any] = {"maxTokens": max_tokens}
+            if _accepts_temperature(model_id):
+                inference_config["temperature"] = 0.2
+
+            # Fable 5 / Mythos 5 reject forced tool use; use the native
+            # structured-output path (outputConfig.textFormat). All other models
+            # keep the proven toolConfig route.
+            if not _supports_forced_tool_use(model_id):
+                return self._call_converse_native(
+                    model_id, tool_name, schema, system_prompt,
+                    user_prompt, inference_config,
+                )
+
             resp = self.client.converse(
                 modelId=model_id,
                 system=[{"text": system_prompt}],
                 messages=[
                     {"role": "user", "content": [{"text": user_prompt}]},
                 ],
-                inferenceConfig={"maxTokens": max_tokens, "temperature": 0.2},
+                inferenceConfig=inference_config,
                 toolConfig={
                     "tools": [
                         {
@@ -328,3 +374,55 @@ class BedrockProvider:
             )
 
         return _call()
+
+    def _call_converse_native(
+        self,
+        model_id: str,
+        tool_name: str,
+        schema: dict,
+        system_prompt: str,
+        user_prompt: str,
+        inference_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Structured output via Converse `outputConfig.textFormat` (JSON schema).
+
+        Fable 5 / Mythos 5 reject `toolChoice={"tool": ...}`, so we constrain the
+        response format directly. The model returns the schema-conforming JSON in
+        a normal text block (no toolUse block); we parse it with json.loads."""
+        resp = self.client.converse(
+            modelId=model_id,
+            system=[{"text": system_prompt}],
+            messages=[
+                {"role": "user", "content": [{"text": user_prompt}]},
+            ],
+            inferenceConfig=inference_config,
+            outputConfig={
+                "textFormat": {
+                    "type": "json_schema",
+                    "structure": {
+                        "jsonSchema": {
+                            "name": tool_name,
+                            # Unlike toolConfig's inputSchema.json (a dict), this
+                            # field wants the schema as a JSON-encoded string.
+                            "schema": json.dumps(schema),
+                        }
+                    },
+                }
+            },
+        )
+
+        for block in resp.get("output", {}).get("message", {}).get("content", []):
+            text = block.get("text")
+            if text:
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        f"Fable native structured output was not valid JSON for "
+                        f"{tool_name}: {e}; head={text[:200]!r}"
+                    )
+
+        raise RuntimeError(
+            f"Bedrock native-format response had no text block for {tool_name}; "
+            f"stopReason={resp.get('stopReason')!r}"
+        )

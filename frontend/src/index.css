@@ -638,3 +638,67 @@ a { color: inherit; text-decoration: none; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ── Mobile / responsive (≤768px) ───────────────────────────── */
+@media (max-width: 768px) {
+  :root {
+    --page-px: 14px;
+    --page-py: 16px;
+  }
+
+  /* Page content wrapper: tighter padding on mobile */
+  .page-content {
+    padding: var(--page-py) var(--page-px) !important;
+  }
+
+  /* Stack any .mobile-stack element vertically on small screens */
+  .mobile-stack {
+    flex-direction: column !important;
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Hide non-essential elements on mobile */
+  .desktop-only { display: none !important; }
+
+  /* Full-width on mobile */
+  .mobile-full { width: 100% !important; min-width: 0 !important; max-width: 100% !important; }
+
+  /* Reduce card radius on mobile */
+  .card { border-radius: 14px !important; }
+
+  /* Deployment readiness card: stack score ring above content on mobile */
+  .score-grid {
+    grid-template-columns: 1fr !important;
+    gap: 20px !important;
+    padding: 18px !important;
+  }
+  /* Remove the vertical divider when stacked */
+  .score-grid > div:first-child {
+    padding-right: 0 !important;
+    border-right: none !important;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 20px;
+  }
+
+  /* Stat grids: 2-col on mobile instead of 4 */
+  .stat-grid-4 {
+    grid-template-columns: 1fr 1fr !important;
+  }
+
+  /* Scrollbar narrower on touch */
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+
+  /* Ensure tap targets are comfortable on touch */
+  .btn-sm { min-height: 40px; }
+  .nav-item { min-height: 44px; }
+
+  /* Two-column grids stack vertically */
+  .analysis-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Radar card: tighten padding so the radar fits */
+  .radar-card {
+    padding: 18px 12px !important;
+  }
+}

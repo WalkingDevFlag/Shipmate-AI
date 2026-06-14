@@ -38,8 +38,9 @@ from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
 from app.services import inflight_registry as ir
 from app.services import session_store
+from app.services import repo_map
 from app.services.github_actions_service import (
-    CheckRunStatus, GitHubActionsService,
+    CheckRunStatus, GitHubActionsService, extract_failing_paths,
 )
 from app.services.github_api_service import GitHubAPIService
 from app.services.github_pr_service import GitHubPRService
@@ -69,6 +70,7 @@ class WatchEntry:
     attempts: int = 0
     history: List[Dict[str, Any]] = field(default_factory=list)
     last_patch_hash: Optional[str] = None
+    reran: bool = False  # flaky guard: at most one rerun-failed-jobs before patching
     status: str = "watching"  # watching | fixing | passed | gave_up | crashed
     last_error: Optional[str] = None
     last_event_at: float = field(default_factory=time.monotonic)
@@ -479,10 +481,58 @@ class CIWatcher:
             entry.status = "gave_up"
             return False
 
+        # Flaky-vs-real guard (A4): if this looks like a transient infra flake
+        # (network/timeout/runner blip) AND there's no structured test/eval
+        # failure to act on, re-run the failed jobs ONCE rather than burning a
+        # Coder attempt on correct code. A real failure re-fails and we patch
+        # it next cycle; a flake goes green. Gated to one rerun via entry.reran.
+        if not entry.reran and head_sha and cls._looks_transient(failure_blob):
+            entry.reran = True
+            entry.attempts -= 1  # this cycle didn't spend a real fix attempt
+            reran = await GitHubActionsService.rerun_failed_jobs(
+                entry.access_token, entry.owner, entry.repo, head_sha,
+            )
+            if reran:
+                entry.status = "watching"
+                cls._touch(
+                    entry,
+                    "transient-looking failure (no structured failures) — "
+                    "re-ran failed jobs once before patching",
+                )
+                return True  # loop back to _await_ci on the rerun
+            # Rerun not accepted — fall through and patch as normal.
+            entry.attempts += 1
+
+        # Fetch the CURRENT contents of the files the failure points at, so
+        # Coder edits real files instead of hallucinating a from-scratch
+        # rewrite. This is the single biggest reliability lever for the loop:
+        # before this, target_files was {"ci_failure.log": ...} ONLY. Best-
+        # effort and fail-open — get_file_content returns None for anything
+        # that doesn't resolve (over-matched path, binary, 404).
+        fetched_files: Dict[str, str] = {}
+        try:
+            paths = extract_failing_paths(failure_blob)
+            for path in paths:
+                content = await GitHubAPIService.get_file_content(
+                    entry.access_token, entry.owner, entry.repo, path, ref=head_sha,
+                )
+                if content is not None:
+                    fetched_files[path] = content
+            if fetched_files:
+                cls._touch(
+                    entry,
+                    f"attempt[{attempt_idx}] fetched {len(fetched_files)} "
+                    f"failing-file(s): {', '.join(fetched_files)}",
+                )
+        except Exception as e:
+            # Never let context-enrichment break the fix loop — Coder can still
+            # work from the failure blob alone (degraded, pre-fix behaviour).
+            logger.info("CIWatcher: failing-file fetch soft-failed: %s", e)
+
         # Ask Coder to diagnose + patch.
         try:
             coder_out = await asyncio.to_thread(
-                cls._invoke_coder, entry, failure_blob,
+                cls._invoke_coder, entry, failure_blob, fetched_files,
             )
         except Exception as e:
             logger.warning("CIWatcher: Coder failed during fix attempt: %s", e)
@@ -546,24 +596,79 @@ class CIWatcher:
     # ── Helpers ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _invoke_coder(entry: WatchEntry, failure_blob: str) -> CoderOutput:
-        """Synchronous Coder invocation (runs on worker thread)."""
-        # We DON'T re-fetch every file in the repo — that's expensive. We
-        # let Coder reason from the failure logs + the original finding's
-        # context. Coder's prompt already says "produce full new file
-        # content"; in CI-fix mode we pass the failure blob as the dominant
-        # piece of context.
-        target_files = {
-            "ci_failure.log": failure_blob,
-        }
+    def _invoke_coder(
+        entry: WatchEntry,
+        failure_blob: str,
+        fetched_files: Optional[Dict[str, str]] = None,
+    ) -> CoderOutput:
+        """Synchronous Coder invocation (runs on worker thread).
+
+        `fetched_files` carries the CURRENT contents of the source files the
+        failure points at (resolved by the async caller via
+        GitHubAPIService.get_file_content). Passing them in target_files turns
+        the fix from "rewrite a file you can't see" into "edit the real file"
+        — the dominant reliability fix for the loop."""
+        fetched_files = fetched_files or {}
+        # The failure blob plus the real failing files. Coder's prompt rule
+        # says "produce full new file content"; with the real file present it
+        # edits rather than hallucinates.
+        target_files: Dict[str, str] = {"ci_failure.log": failure_blob}
+        target_files.update(fetched_files)
         ctx = entry.repo_lens or RepoLensSummary()
+
+        # Anti-hallucination context: a repo map scoped to the failing files so
+        # imports/symbols in the rewrite stay grounded in real modules. Built
+        # from the fetched files (fail-open to "" on a thin tree).
+        repo_map_str = ""
+        if fetched_files:
+            try:
+                file_tree = list(fetched_files) + list(ctx.entry_points or [])
+                repo_map_str = repo_map.build_repo_map(
+                    file_tree, fetched_files, list(fetched_files),
+                )
+            except Exception as e:  # never let context-building break the fix
+                logger.debug("CIWatcher: repo_map build soft-failed: %s", e)
+
+        # A2: feed prior failed attempts back in so retries are INFORMED, not
+        # blind. Each history item is recorded after a commit (attempt,
+        # files_changed, summary, patch_hash). Without this, attempts 2-3 just
+        # re-converge on near-duplicate patches.
+        history_block = ""
+        if entry.history:
+            lines = []
+            for h in entry.history:
+                files = ", ".join(h.get("files_changed", [])) or "(no files)"
+                summary = (h.get("summary") or "").strip()
+                lines.append(
+                    f"  • Attempt {h.get('attempt')}: edited [{files}] — "
+                    f"{summary[:200]} → CI STILL FAILED."
+                )
+            history_block = (
+                "PRIOR ATTEMPTS THAT DID NOT WORK (do NOT repeat these — try a "
+                "DIFFERENT fix):\n" + "\n".join(lines) + "\n\n"
+            )
+
+        files_hint = (
+            (
+                "The current contents of the failing file(s) are in "
+                f"`target_files`: {', '.join(fetched_files)}. EDIT them — return "
+                "the full corrected content for the file(s) you change. "
+            )
+            if fetched_files
+            else (
+                "The failing source file(s) could not be auto-fetched; reconstruct "
+                "the fix from the failure log and the finding context. "
+            )
+        )
+
         brief = CoderBrief(
             task=(
+                f"{history_block}"
                 f"The previous patch you generated was committed and CI failed. "
                 f"Read `target_files['ci_failure.log']`. If it begins with a "
-                f"'STRUCTURED TEST FAILURES (JUnit)' section, TRUST THAT FIRST — "
-                f"it lists each failing test id and its exception, which pinpoints "
-                f"the regression more precisely than the raw log tail below it. "
+                f"'STRUCTURED TEST FAILURES (JUnit)' or '=== EVAL FAILURES ===' "
+                f"section, TRUST THAT FIRST — it pinpoints the regression more "
+                f"precisely than the raw log tail below it. {files_hint}"
                 f"Then produce a corrective patch. The originating finding was: "
                 f"{entry.finding.title}. "
                 f"Description: {entry.finding.description}. "
@@ -578,11 +683,60 @@ class CIWatcher:
             tech_stack=ctx.tech_stack,
             entry_points=ctx.entry_points,
             target_files=target_files,
+            repo_map=repo_map_str,
             finding_kind="ci_failure",
             finding_id=f"{entry.finding.id}-fix-{entry.attempts}",
             finding_severity="high",
         )
         return CoderAgent().run(brief, deployment_hint="smart")
+
+    # Substrings that mark a real, deterministic failure — if any are present
+    # we do NOT treat the run as flaky (there's something concrete to fix).
+    _STRUCTURED_FAILURE_MARKERS = (
+        "=== STRUCTURED TEST FAILURES (JUnit) ===",
+        "=== EVAL FAILURES ===",
+        "AssertionError",
+        "SyntaxError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "NameError",
+        "TypeError",
+        "FAILED ",
+    )
+    # Substrings that suggest a transient infra/runner flake rather than a code bug.
+    _TRANSIENT_MARKERS = (
+        "connection reset",
+        "connection refused",
+        "timed out",
+        "timeout",
+        "temporary failure in name resolution",
+        "could not resolve host",
+        "503 server error",
+        "502 bad gateway",
+        "429 too many requests",
+        "network is unreachable",
+        "tls handshake",
+        "runner has received a shutdown signal",
+        "the runner has received a shutdown",
+        "lost communication with the server",
+        "econnreset",
+        "etimedout",
+    )
+
+    @classmethod
+    def _looks_transient(cls, failure_blob: str) -> bool:
+        """True when the failure blob looks like an infra flake we should retry
+        rather than patch: it carries a transient-network/runner marker AND has
+        NO structured (assertion/import/JUnit/eval) failure to act on. Biased
+        toward False — when in doubt, patch (a wasted rerun is cheaper than a
+        skipped real fix only at the margin, but a false 'flaky' verdict that
+        delays a real fix is worse, so require an explicit transient signal)."""
+        if not failure_blob:
+            return False
+        low = failure_blob.lower()
+        if any(m.lower() in low for m in cls._STRUCTURED_FAILURE_MARKERS):
+            return False
+        return any(m in low for m in cls._TRANSIENT_MARKERS)
 
     @staticmethod
     def _hash_files(files: List[Any]) -> str:

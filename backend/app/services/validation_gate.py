@@ -379,13 +379,25 @@ def gate_patch(files: List[Dict[str, str]]) -> Tuple[GateResult, Dict[str, Optio
     so the orchestrator can keep the on-disk state if it wants to (e.g.
     to inspect what Coder produced for debugging).
 
-    The orchestrator's call site is:
+    Two execution strategies, chosen at call time:
+
+      • WORKTREE (default, when git is available): the gate runs in a throwaway
+        `git worktree` checked out at HEAD — the real working tree is NEVER
+        mutated, so a crash mid-gate can't leave the checkout dirty and two
+        concurrent actuates can't race on the same files. We return an EMPTY
+        snapshot in that case (nothing to restore — the real tree was untouched).
+
+      • SNAPSHOT (fallback, when no git worktree / kill-switched off): the
+        proven snapshot → apply → pytest → caller-restores path, returning the
+        snapshot to restore.
+
+    The orchestrator's call site is unchanged and correct under both:
 
         snap = ValidationGate.snapshot_files([f.path for f in files])
         try:
             result, _ = ValidationGate.gate_patch(serialized_files)
             if not result.passed:
-                ValidationGate.restore_snapshot(snap)
+                ValidationGate.restore_snapshot(snap)   # no-op when {} (worktree)
                 return ActuateResponse(status='pytest_rejected', ...)
             ValidationGate.update_baseline(result.after)
             # ... proceed to branch + commit + PR ...
@@ -395,6 +407,31 @@ def gate_patch(files: List[Dict[str, str]]) -> Tuple[GateResult, Dict[str, Optio
     """
     started = time.time()
     paths = [f["path"] for f in files]
+
+    # Prefer the worktree gate: it never touches the real tree. Pass our cached
+    # baseline so it runs pytest exactly ONCE (it compares against before_count
+    # instead of measuring a clean baseline in a second worktree). A None return
+    # means no worktree could be created → fall through to the snapshot path.
+    try:
+        from app.services import sandbox
+        if sandbox.worktree_gate_enabled():
+            wt_result = sandbox.worktree_gate(
+                files, ref="HEAD", before_count=baseline_pass_count(),
+            )
+            if wt_result is not None:
+                logger.info(
+                    "gate_patch: worktree strategy %s in %.1fs",
+                    "ACCEPT" if wt_result.passed else "REJECT", time.time() - started,
+                )
+                # Empty snapshot: the real tree was never modified, so the
+                # caller's restore_snapshot is a harmless no-op.
+                return wt_result, {}
+    except Exception as e:
+        logger.warning(
+            "gate_patch: worktree strategy errored (%s) — falling back to snapshot", e,
+        )
+
+    # ── Snapshot fallback (no git worktree available, or kill-switched off) ──
     snap = snapshot_files(paths)
 
     write_files_to_tree(files)
@@ -536,14 +573,40 @@ def _safe_clone_url(owner: str, repo: str, access_token: Optional[str]) -> str:
     return f"https://github.com/{owner}/{repo}.git"
 
 
-def _stripped_env() -> Dict[str, str]:
-    """A minimal environment for the untrusted test subprocess — deliberately
-    omits everything from the backend's env (BEDROCK_*, GITHUB_*, AWS_*, the
-    OAuth secret, …) so a hostile test script can't exfiltrate our secrets."""
-    keep = {}
-    for var in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"):
+def _stripped_env(home_dir: Optional[str] = None) -> Dict[str, str]:
+    """A minimal environment for the untrusted test subprocess.
+
+    Omits everything from the backend's env (BEDROCK_*, GITHUB_*, AWS_*, the
+    OAuth secret, …) so a hostile test script can't exfiltrate our secrets.
+
+    CRITICAL: HOME is NOT inherited. The original kept the real HOME, so a
+    hostile test could still `open(os.path.expanduser('~/.aws/credentials'))`
+    and read the operator's cloud creds (and `~/.config/gh`, `~/.ssh`, `~/.netrc`)
+    even though every secret ENV var was stripped. When `home_dir` is supplied
+    (an ephemeral dir the caller creates and cleans up), HOME + the XDG dirs are
+    redirected there, so `~` resolves into an empty directory. When None (legacy
+    callers), HOME is simply absent — never the real one."""
+    keep: Dict[str, str] = {}
+    # HOME deliberately excluded from this inherit list — it's set below.
+    # LD_LIBRARY_PATH / DYLD_LIBRARY_PATH are the dynamic-loader search paths for
+    # OUR OWN interpreter — they are NOT secrets (they point at the Python
+    # install dir, already discoverable via PATH/sys.executable). They MUST be
+    # preserved: GitHub's setup-python toolcache interpreter is dynamically
+    # linked against libpython in …/x64/lib and cannot even START without
+    # LD_LIBRARY_PATH — stripping it made the nested `python -m pytest` exit 127
+    # (loader failure) on the Linux runner before pytest ran, while passing on
+    # macOS/Homebrew Python (lib path baked into rpath). Keeping them is safe and
+    # necessary for the target-repo gate's subprocess to launch.
+    for var in (
+        "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT",
+        "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    ):
         if var in os.environ:
             keep[var] = os.environ[var]
+    if home_dir:
+        keep["HOME"] = home_dir
+        keep["XDG_CONFIG_HOME"] = os.path.join(home_dir, ".config")
+        keep["XDG_CACHE_HOME"] = os.path.join(home_dir, ".cache")
     keep["SHIPMATE_SANDBOX"] = "1"   # marker tests can branch on if they want
     keep["CI"] = "true"
     return keep
@@ -570,7 +633,14 @@ def gate_patch_target_repo(
         # Caller shouldn't reach here, but be safe: treat as skipped/pass.
         return GateResult(True, 0, 0, 0, "target-repo gate disabled", "")
 
-    workdir = tempfile.mkdtemp(prefix=_TARGET_TMP_PREFIX + uuid.uuid4().hex[:8] + "_")
+    # A parent holds two SIBLINGS: the clone target (`workdir`, which git
+    # requires to be empty) and an ephemeral HOME. Pointing HOME here means a
+    # hostile test's `open('~/.aws/credentials')` resolves into an empty dir
+    # instead of the operator's real creds. Both removed in finally.
+    parent = tempfile.mkdtemp(prefix=_TARGET_TMP_PREFIX + uuid.uuid4().hex[:8] + "_")
+    workdir = os.path.join(parent, "repo")
+    home_dir = os.path.join(parent, "home")
+    os.makedirs(home_dir, exist_ok=True)
     try:
         # 1. Shallow clone the branch.
         clone_url = _safe_clone_url(owner, repo, access_token)
@@ -579,7 +649,7 @@ def gate_patch_target_repo(
                 ["git", "clone", "--depth=1", "--single-branch",
                  "--branch", branch, clone_url, workdir],
                 capture_output=True, text=True, timeout=_CLONE_TIMEOUT_S,
-                env=_stripped_env(),
+                env=_stripped_env(home_dir),
             )
         except subprocess.TimeoutExpired:
             return GateResult(False, 0, 0, 0,
@@ -589,6 +659,20 @@ def gate_patch_target_repo(
             tail = (proc.stderr or "")[-300:].replace(access_token or "\0", "***")
             return GateResult(False, 0, 0, 0,
                               f"clone failed for {owner}/{repo}@{branch}", tail)
+
+        # 1b. SCRUB the clone credential. `git clone` persists the tokened
+        #     remote URL into <workdir>/.git/config; the untrusted suite runs
+        #     with that clone as cwd and could read the bearer token out of it.
+        #     Rewrite the remote to the tokenless URL so there's no credential
+        #     on disk for the suite to lift.
+        try:
+            subprocess.run(
+                ["git", "-C", workdir, "remote", "set-url", "origin",
+                 f"https://github.com/{owner}/{repo}.git"],
+                capture_output=True, text=True, timeout=15, env=_stripped_env(home_dir),
+            )
+        except Exception as e:  # pragma: no cover - best-effort scrub
+            logger.debug("could not scrub clone remote (%s)", e)
 
         # 2. Apply the patch files into the clone (reuse the same path-safety
         #    rules as the local gate, rooted at the clone dir).
@@ -606,12 +690,54 @@ def gate_patch_target_repo(
                 summary_tail="",
             )
 
-        # 4. Run the tests in the clone with a stripped env + timeout.
+        # 4. Run the tests. The docker jail (--network none, read-only root,
+        #    tmpfs HOME, resource caps) is the ONLY real containment for
+        #    untrusted code, so it's REQUIRED by default. When docker is absent
+        #    we FAIL CLOSED — we do NOT run a stranger's test suite as a bare
+        #    host subprocess, because the env-strip + HOME-redirect floor does
+        #    nothing against secrets at ABSOLUTE paths (e.g. this repo's own
+        #    .env) and the host fallback has unrestricted network — a hostile
+        #    conftest could read and exfiltrate them. The unsafe host path is
+        #    available ONLY behind an explicit second opt-in for operators who
+        #    accept the risk on an already-isolated host.
         try:
-            proc = subprocess.run(
-                cmd, cwd=workdir, capture_output=True, text=True,
-                timeout=_TARGET_TEST_TIMEOUT_S, env=_stripped_env(),
+            from app.services import sandbox
+            use_docker = sandbox.docker_available()
+        except Exception:
+            use_docker = False
+
+        allow_host = os.getenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "0") == "1"
+        if not use_docker and not allow_host:
+            reason = (
+                "docker unavailable — refusing to run untrusted target-repo tests "
+                "on the host without isolation (set SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS=1 "
+                "ONLY on an already-isolated host to override). Gate skipped."
             )
+            logger.warning("gate_patch_target_repo: %s (%s/%s)", reason, owner, repo)
+            # Fail OPEN on the verdict (don't block the PR) but DON'T execute
+            # untrusted code: the patch simply ships without target-repo test
+            # validation, which is the pre-Phase-2 behaviour for docker-less hosts.
+            return GateResult(True, 0, 0, 0, reason, "")
+
+        try:
+            if use_docker:
+                from app.services import sandbox
+                argv = sandbox.build_docker_argv(workdir, cmd)
+                logger.info("gate_patch_target_repo: running tests in docker jail")
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True,
+                    timeout=_TARGET_TEST_TIMEOUT_S,
+                )
+            else:
+                # Explicitly opted into the unsandboxed host path (allow_host).
+                logger.warning(
+                    "gate_patch_target_repo: running UNSANDBOXED on host "
+                    "(SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS=1) — operator-accepted risk",
+                )
+                proc = subprocess.run(
+                    cmd, cwd=workdir, capture_output=True, text=True,
+                    timeout=_TARGET_TEST_TIMEOUT_S, env=_stripped_env(home_dir),
+                )
         except subprocess.TimeoutExpired:
             return GateResult(False, 0, 0, 0,
                               f"target tests timed out (>{_TARGET_TEST_TIMEOUT_S}s)", "")
@@ -629,13 +755,24 @@ def gate_patch_target_repo(
 
         # 'tests must not fail' — a non-zero exit with parsed failures rejects.
         ok = failed == 0 and proc.returncode == 0
-        reason = "ok" if ok else f"target tests failed ({failed} failing, exit={proc.returncode})"
+        if ok:
+            reason = "ok"
+        else:
+            # Include a stderr tail on failure — a bare 'exit=127' is
+            # undebuggable (was it a loader failure? missing runner? import
+            # crash?). The parsed counters miss a process that died before
+            # emitting a pytest summary line, so surface the raw tail.
+            err_tail = (proc.stderr or "")[-600:].strip()
+            reason = f"target tests failed ({failed} failing, exit={proc.returncode})"
+            if proc.returncode != 0 and err_tail:
+                reason += f" | stderr: {err_tail}"
         logger.info("gate_patch_target_repo: %s/%s %s (%dp/%df) in %.1fs",
                     owner, repo, "ACCEPT" if ok else "REJECT", passed, failed, elapsed)
         return GateResult(ok, before=passed, after=passed, failed=failed,
                           reason=reason, summary_tail=out[-2000:])
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        # Remove the whole parent (clone + ephemeral HOME) in one shot.
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def _apply_files_to_dir(base_dir: str, files: List[Dict[str, str]]) -> List[str]:

@@ -95,7 +95,17 @@ def save_report(report: Any) -> int:
             ),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        row_id = int(cur.lastrowid)
+        # EvalOps metric (Phase 5): emit one event per persisted analysis so the
+        # metric sink has a real producer — a ValidationSpec can assert
+        # MetricExpectation("report_persisted"). Fail-open: never let a metrics
+        # error break persistence.
+        try:
+            from app.services import metrics
+            metrics.emit("report_persisted", repo=f"{owner}/{name}", score=int(getattr(report, "readiness_score", 0) or 0))
+        except Exception:
+            pass
+        return row_id
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("report_store.save_report failed: %s", e)
         return -1

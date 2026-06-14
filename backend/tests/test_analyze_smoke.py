@@ -68,7 +68,7 @@ def test_analyze_happy_path_returns_report(monkeypatch):
     # outputs, which is exactly the offline path we want to verify in CI.
     async def ok_auth(token, owner, repo):
         return None
-    monkeypatch.setattr(analysis_mod, "_verify_repo_write_access", ok_auth)
+    monkeypatch.setattr(analysis_mod, "verify_repo_write_access", ok_auth)
 
     async def fake_index(cls, **kwargs):
         return _fake_repo_index()
@@ -103,7 +103,7 @@ def test_analyze_persists_to_history(monkeypatch):
 
     async def ok_auth(token, owner, repo):
         return None
-    monkeypatch.setattr(analysis_mod, "_verify_repo_write_access", ok_auth)
+    monkeypatch.setattr(analysis_mod, "verify_repo_write_access", ok_auth)
 
     async def fake_index(cls, **kwargs):
         return _fake_repo_index()

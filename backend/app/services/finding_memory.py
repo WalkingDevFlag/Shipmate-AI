@@ -251,6 +251,75 @@ def remember(
         logger.debug("finding_memory.remember failed (%s)", e)
 
 
+def remember_detected(
+    repo_full_name: str,
+    finding_sig: str,
+    kind: str,
+    title: str,
+    description: str = "",
+) -> None:
+    """Record a finding that was merely SURFACED (not yet shipped/dismissed) so
+    yield metrics can count detections, WITHOUT making it suppress future runs.
+
+    Two safety rules vs plain remember():
+      1. State is 'detected' — NOT in _SUPPRESSING_STATES — so this never hides a
+         still-real finding (an unresolved issue must keep surfacing until it is
+         actually shipped or explicitly dismissed). This is the deliberate
+         answer to the memory-gap design tension: observe everything, suppress
+         only terminal user actions.
+      2. NEVER downgrade a terminal row: if this signature is already
+         shipped/dismissed, leave it (a plain remember()'s DO UPDATE would
+         otherwise overwrite state='shipped' with 'detected' and silently
+         re-open a suppressed finding).
+    Fail-open on any error."""
+    if not repo_full_name or not finding_sig:
+        return
+    try:
+        text = _normalize_text(title, description)
+        vec_kind, vec = embed(text)
+        c = _conn()
+        # Single atomic upsert with a guarded DO UPDATE: the WHERE clause refuses
+        # to overwrite a TERMINAL (shipped/dismissed) row, so a concurrent
+        # dismiss/ship that commits between a would-be read and write can't be
+        # downgraded to 'detected' (the read-then-write race the review flagged).
+        # New rows insert as 'detected'; existing terminal rows are left intact.
+        placeholders = ",".join("?" * len(_SUPPRESSING_STATES))
+        c.execute(
+            "INSERT INTO finding_memory "
+            "(repo_full_name, finding_sig, kind, state, title, text, "
+            " vec_kind, vec_json, updated_at) "
+            "VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?) "
+            "ON CONFLICT(repo_full_name, finding_sig) DO UPDATE SET "
+            "  title=excluded.title, text=excluded.text, kind=excluded.kind, "
+            "  vec_kind=excluded.vec_kind, vec_json=excluded.vec_json, "
+            "  updated_at=excluded.updated_at "
+            f"  WHERE finding_memory.state NOT IN ({placeholders})",
+            (repo_full_name, finding_sig, kind, title[:200], text[:2000],
+             vec_kind, json.dumps(vec), int(time.time()), *_SUPPRESSING_STATES),
+        )
+        c.commit()
+    except Exception as e:  # pragma: no cover - fail-open
+        logger.debug("finding_memory.remember_detected failed (%s)", e)
+
+
+def detection_count(repo_full_name: str = "") -> int:
+    """How many distinct findings have ever been detected/recorded for a repo
+    (any state). Read-only; used by the yield metrics. 0 on error."""
+    try:
+        c = _conn()
+        if repo_full_name:
+            r = c.execute(
+                "SELECT COUNT(*) AS n FROM finding_memory WHERE repo_full_name=?",
+                (repo_full_name,),
+            ).fetchone()
+        else:
+            r = c.execute("SELECT COUNT(*) AS n FROM finding_memory").fetchone()
+        return int(r["n"]) if r else 0
+    except Exception as e:  # pragma: no cover
+        logger.debug("detection_count failed (%s)", e)
+        return 0
+
+
 # ── Query ────────────────────────────────────────────────────────────────────
 
 def _load_suppressing(repo_full_name: str) -> List[Dict[str, Any]]:

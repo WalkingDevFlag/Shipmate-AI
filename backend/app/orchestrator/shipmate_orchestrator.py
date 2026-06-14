@@ -219,6 +219,12 @@ class ShipMateOrchestrator:
             repo_context, plan_forge_out, guardrail_out, testpilot_out
         )
 
+        # Record what actually SURFACED (post-filter) as 'detected' in finding
+        # memory — for yield metrics (detections vs shipped/dismissed). This does
+        # NOT suppress future runs (detected ∉ suppressing states): an unresolved
+        # finding must keep surfacing until shipped or dismissed. Fail-open.
+        self._remember_detected(repo_context, guardrail_out, plan_forge_out)
+
         score_breakdown = ScoringService.calculate(
             repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
         )
@@ -304,11 +310,19 @@ class ShipMateOrchestrator:
             f = fc.filter_already_resolved(f, file_tree, key_files, kind="guardrail")
             f = fc.filter_suppressed(f, "guardrail", full_name)
             # LLM critic verify against the real code blob (fail-open inside).
+            # The critic used to judge against the TRUNCATED top-N blob (3500
+            # chars/file), so a defense living deep in a big file (main.py's
+            # proxy-trust gate at char ~6188) was invisible → false positives
+            # recurred. Build a FINDING-AWARE blob that appends the FULL content
+            # of each cited file, so the critic can actually see the control.
             try:
                 from app.services.llm_service import LLMService
                 provider = LLMService.provider()
-                code_blob = LLMService.opportunity_code_blob(repo_context) if provider else ""
-                if provider and code_blob:
+                if provider:
+                    base_blob = LLMService.opportunity_code_blob(repo_context)
+                    code_blob = fc.finding_aware_code_blob(
+                        f, key_files, fallback_blob=base_blob,
+                    )
                     f = fc.verify_findings(f, code_blob, provider)
             except Exception:
                 pass
@@ -336,3 +350,36 @@ class ShipMateOrchestrator:
             pass
 
         return plan_forge_out, guardrail_out, testpilot_out
+
+    def _remember_detected(self, repo_context, guardrail_out, plan_forge_out):
+        """Record surfaced findings as 'detected' in finding_memory for yield
+        metrics. Non-suppressing state + never downgrades a terminal row, so it
+        can't hide a real finding. Fully fail-open — observability must never
+        break the analyze path."""
+        try:
+            from app.services import finding_memory as fm
+            from app.services.finding_critic import finding_signature
+            info = repo_context.get("repo_info") or {}
+            owner = (
+                info.get("owner", {}).get("login", "")
+                if isinstance(info.get("owner"), dict) else info.get("owner", "")
+            )
+            full_name = info.get("full_name", "") or (
+                f"{owner}/{info.get('name','')}" if owner and info.get("name") else ""
+            )
+            if not full_name:
+                return
+            for kind, items in (
+                ("guardrail", getattr(guardrail_out, "findings", []) or []),
+                ("blocker", getattr(plan_forge_out, "blockers", []) or []),
+            ):
+                for f in items:
+                    title = getattr(f, "title", "") or ""
+                    if not title:
+                        continue
+                    sig = finding_signature(kind, title, getattr(f, "file", None))
+                    fm.remember_detected(
+                        full_name, sig, kind, title, getattr(f, "description", "") or "",
+                    )
+        except Exception as e:  # pragma: no cover - fail-open
+            pass

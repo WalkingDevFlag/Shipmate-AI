@@ -28,6 +28,9 @@ class BuildPlanRequest(BaseModel):
     # When True, ungrounded opportunities are kept (flagged grounded=False)
     # instead of dropped — useful for debugging the discovery quality.
     include_ungrounded: bool = False
+    # "opportunity" (default, conservative product-review fixes) or "innovation"
+    # (ambitious/novel ideas via discover_innovations + innovation_critic).
+    mode: str = "opportunity"
 
 
 class BuildExecuteRequest(BaseModel):

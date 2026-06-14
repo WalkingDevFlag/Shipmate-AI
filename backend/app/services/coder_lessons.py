@@ -133,6 +133,16 @@ def distill(gate: str, issue: str) -> Tuple[str, str]:
             "from the original verbatim."
         )
 
+    # Eval gate (P5) — check BEFORE pytest so an EvalOps message that happens to
+    # contain the substring 'test' isn't miscategorized as a pytest regression.
+    if gate == "eval" or "evalops" in low or "acceptance spec" in low or "scenario" in low:
+        return "eval-acceptance", (
+            "ACCEPTANCE: a prior patch passed lint/tests but FAILED its EvalOps "
+            "acceptance spec — the change did not observably WORK against the "
+            "running app (a scenario/metric/log assertion failed). Make the "
+            "feature actually function end-to-end, not just compile and pass unit tests."
+        )
+
     if gate == "pytest" or "test" in low or "regression" in low:
         return "pytest-regression", (
             "TEST SAFETY: a prior patch broke the test suite. Run the change "
@@ -146,6 +156,15 @@ def distill(gate: str, issue: str) -> Tuple[str, str]:
             "ACTUALLY FIX IT: a prior patch passed tests but left the flagged "
             "pattern in place. Make sure the change OBSERVABLY removes the issue "
             "the finding describes, not just compiles."
+        )
+
+    if gate == "phantom" or "empty patch" in low or "no files" in low:
+        return "phantom-patch", (
+            "NO PHANTOM PATCHES: a prior response returned ZERO file edits while "
+            "the summary narrated a fix (often with a clean VERIFY line). If you "
+            "make a change, emit the actual file content; if you genuinely "
+            "cannot, set the summary to 'DECLINED: <reason>' — never stamp a "
+            "clean VERIFY on an empty patch."
         )
 
     # Fallback — keep the gate as the key so repeated generic failures still
@@ -236,6 +255,27 @@ def top_lessons(
     except Exception as e:  # pragma: no cover
         logger.debug("coder_lessons.top_lessons failed (%s)", e)
         return []
+
+
+def gate_breakdown(repo_full_name: Optional[str] = None) -> Dict[str, int]:
+    """Total rejections grouped by gate (lint/scope/pytest/resolution/eval/other),
+    summed over hit_count. This is the false-positive / wasted-actuation proxy
+    for the yield dashboard: a Coder patch rejected at a gate is work that
+    didn't ship. Empty dict on error (fail-open)."""
+    try:
+        if repo_full_name:
+            rows = _conn().execute(
+                "SELECT gate, SUM(hit_count) AS n FROM coder_lessons "
+                "WHERE repo_full_name=? GROUP BY gate", (repo_full_name,),
+            ).fetchall()
+        else:
+            rows = _conn().execute(
+                "SELECT gate, SUM(hit_count) AS n FROM coder_lessons GROUP BY gate",
+            ).fetchall()
+        return {(r["gate"] or "other"): int(r["n"]) for r in rows}
+    except Exception as e:  # pragma: no cover
+        logger.debug("coder_lessons.gate_breakdown failed (%s)", e)
+        return {}
 
 
 def lessons_digest(repo_full_name: str, limit: int = _MAX_DIGEST_LESSONS) -> str:

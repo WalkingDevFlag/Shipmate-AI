@@ -112,9 +112,9 @@ def _maybe_invalidate_provider(err: BaseException) -> None:
     if any(m in msg for m in _TRANSIENT_AUTH_MARKERS):
         logger.warning(
             "LLMService: detected transient auth failure (%s) — invalidating "
-            "provider cache. Next request will rebuild boto3 with fresh "
-            "credentials. If you just ran `ada credentials update`, the next "
-            "analyze call should succeed.",
+            "provider cache. The next request rebuilds the LLM client with "
+            "freshly-resolved credentials, so a refreshed key/token takes "
+            "effect without a restart.",
             type(err).__name__,
         )
         # Reset under the same lock _get_provider uses, so an invalidation can't
@@ -388,7 +388,7 @@ class LLMService:
             # Reports→PlanForge: the model never saw what already exists and had
             # no memory of what it proposed before.
             code_blob = _repo_code_blob(
-                context, max_files=8, max_chars_per_file=3500,
+                context, max_files=8,
                 prefer=("routes", "main", "api", "service", "agent",
                         "orchestrator", "components", "pages", "hooks", "lib"),
             )
@@ -449,7 +449,7 @@ class LLMService:
 
         try:
             code_blob = _repo_code_blob(
-                context, max_files=6, max_chars_per_file=3500,
+                context, max_files=6,
                 prefer=("auth", "cors", "main", "security", ".env", "config", "routes"),
             )
             # Recurrence-aware (same as PlanForge/Opportunity discovery): tell the
@@ -583,7 +583,7 @@ class LLMService:
 
         try:
             code_blob = _repo_code_blob(
-                context, max_files=6, max_chars_per_file=3500,
+                context, max_files=6,
                 prefer=("routes", "main", "api", "service", "agent", "handler"),
             )
             user = _user_prompt_testpilot_discovery(context, base, code_blob)
@@ -608,7 +608,7 @@ class LLMService:
         the discoverer saw — same contract as finding_critic using the agent's
         code_blob."""
         return _repo_code_blob(
-            context, max_files=8, max_chars_per_file=3500,
+            context, max_files=8,
             prefer=("routes", "main", "api", "service", "agent",
                     "orchestrator", "components", "pages", "hooks", "lib"),
         )
@@ -659,6 +659,79 @@ class LLMService:
             logger.warning("Opportunity discovery failed (%s); returning none", e)
             _maybe_invalidate_provider(e)
             return []
+
+    @classmethod
+    def discover_innovations(
+        cls, context: Dict[str, Any], max_opportunities: int = 6,
+        *, exclude_titles: Optional[List[str]] = None,
+    ) -> List[Opportunity]:
+        """Sibling of `discover_opportunities`, INVERTED posture: instead of
+        conservative product-review fixes, ask for AMBITIOUS, novel, sometimes-
+        architectural ideas — new agent passes, new capabilities, research-grade
+        directions — the kind the conservative discovery prompt explicitly tells
+        the model NOT to emit ('speculative rewrites or future architecture').
+
+        Same output shape (Opportunity) and same fail-open contract. The
+        deterministic floor (must cite real files, must not already exist) is
+        still enforced downstream by `innovation_critic` — novelty is rewarded,
+        but groundlessness is not."""
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "Innovation discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r).", os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return []
+        try:
+            code_blob = cls.opportunity_code_blob(context)
+            capability_digest = _capability_digest(context)
+            user = _user_prompt_innovation_discovery(
+                context, code_blob, max_opportunities,
+                capability_digest=capability_digest,
+                exclude_titles=exclude_titles or [],
+            )
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_INNOVATION_SYSTEM,
+                user_prompt=user,
+                schema_class=OpportunityDiscovery,
+                deployment_hint="smart",
+            )
+            return _coerce_opportunities(discovery, max_opportunities)
+        except Exception as e:
+            logger.warning("Innovation discovery failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return []
+
+    @classmethod
+    def research_codebase(
+        cls, context: Dict[str, Any], graph_summary: Dict[str, Any],
+        *, question: str = "", max_findings: int = 8,
+    ) -> Optional["_ResearchDiscovery"]:
+        """Codebase deep-research pass: answer a question and/or surface
+        dataflow-cleanup findings (dead code, cycles, god-modules, coupling),
+        GROUNDED on the reference-graph summary so the model reasons about real
+        edges, not guesses. Returns a _ResearchDiscovery (answer + findings) or
+        None when the provider is unavailable (fail-open)."""
+        provider = _get_provider()
+        if provider is None:
+            return None
+        try:
+            code_blob = cls.opportunity_code_blob(context)
+            user = _user_prompt_research(
+                context, code_blob, graph_summary,
+                question=question, max_findings=max_findings,
+            )
+            disc = provider.invoke_structured_sync(
+                system_prompt=_RESEARCH_SYSTEM,
+                user_prompt=user,
+                schema_class=_ResearchDiscovery,
+                deployment_hint="smart",
+            )
+            return _salvage_research_findings(disc)
+        except Exception as e:
+            logger.warning("Codebase research failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return None
 
 
 # ─── Discovery — schemas ─────────────────────────────────────────────────────
@@ -756,26 +829,148 @@ class OpportunityDiscovery(BaseModel):
     )
 
 
+class _ResearchFinding(BaseModel):
+    title: str = Field(..., description="Concise finding title — 4-9 words.")
+    kind: str = Field(..., description="One of: dataflow, dead_code, coupling, risk, observation.")
+    severity: str = Field(..., description="One of: high, medium, low.")
+    detail: str = Field(..., description="2-3 sentences: what it is, concretely, for THIS repo.")
+    evidence: List[str] = Field(default_factory=list, description="1-3 REAL file paths / constructs that prove it.")
+    suggested_action: str = Field(default="", description="One concrete next step (NOT a full plan).")
+    graph_signal: str = Field(default="", description="Which reference-graph signal backs this, verbatim (e.g. 'fan_in=11', 'cycle a<->b', 'unreferenced export: foo'). Empty if not graph-derived.")
+
+
+class _ResearchDiscovery(BaseModel):
+    """LLM codebase-research output: a narrative answer + grounded findings."""
+    answer: str = Field(default="", description="Narrative answer to the asked question. Empty when no question was asked (open audit).")
+    findings: List[_ResearchFinding] = Field(
+        default_factory=list,
+        description="Grounded loops/holes/tweaks/dataflow issues. Each MUST cite real files; prefer findings the reference-graph summary supports.",
+    )
+
+
+# Two shapes of the Bedrock multi-field forced-tool-call leak, where the model
+# serializes the `findings` ARRAY into the `answer` STRING instead of the
+# structured field: an XML param tag `<parameter name="findings">[...]>` or a
+# bare JSON `"findings": [...]`. Both observed live on Opus-4.8/Bedrock for the
+# two-field research schema (the single-list opportunity schema never leaks).
+_FINDINGS_XML_RE = re.compile(
+    r'<\s*(?:antml:)?parameter\s+name="findings"\s*>\s*(\[.*\])', re.DOTALL,
+)
+_FINDINGS_JSON_RE = re.compile(r'"findings"\s*:\s*(\[.*\])', re.DOTALL)
+
+
+def _salvage_research_findings(disc: Optional["_ResearchDiscovery"]) -> Optional["_ResearchDiscovery"]:
+    """Recover findings the model leaked into `answer` as a serialized array
+    instead of the structured field. No-op when findings already populated or
+    no leak is present. Trims the leaked blob off the answer so the UI shows
+    clean prose. Fail-safe: any parse error leaves `disc` untouched."""
+    if disc is None or disc.findings:
+        return disc
+    answer = disc.answer or ""
+    m = _FINDINGS_XML_RE.search(answer) or _FINDINGS_JSON_RE.search(answer)
+    if not m:
+        return disc
+    blob = m.group(1)
+    # The regex is greedy to the last ']'; walk back to a json-parseable array.
+    parsed = None
+    while blob.endswith("]"):
+        try:
+            parsed = json.loads(blob)
+            break
+        except Exception:
+            cut = blob.rfind("]", 0, len(blob) - 1)
+            if cut == -1:
+                break
+            blob = blob[: cut + 1]
+    if not isinstance(parsed, list) or not parsed:
+        return disc
+    recovered: List[_ResearchFinding] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            recovered.append(_ResearchFinding(**{
+                "title": item.get("title", ""),
+                "kind": item.get("kind", "observation"),
+                "severity": item.get("severity", "medium"),
+                "detail": item.get("detail", ""),
+                "evidence": item.get("evidence", []) or [],
+                "suggested_action": item.get("suggested_action", "") or "",
+                "graph_signal": item.get("graph_signal", "") or "",
+            }))
+        except Exception:
+            continue
+    if recovered:
+        disc.findings = recovered
+        # Strip the leaked blob + any stray open/close param tags off the prose.
+        clean = answer[: m.start()]
+        clean = re.sub(r'<\s*/?\s*(?:antml:)?parameter[^>]*>\s*$', "", clean).rstrip()
+        clean = clean.rstrip("<").rstrip()
+        disc.answer = clean
+        logger.info("research: salvaged %d findings leaked into answer", len(recovered))
+    return disc
+
+
 # ─── Discovery — code-blob builder ───────────────────────────────────────────
+
+# Total body budget for the discovery code blob, in CHARS (≈ chars/4 tokens).
+# Design: this is MAP-FIRST. The cheap SYMBOL MAP (signatures of every parseable
+# file) gives breadth — the model can NAME any file as relevant — so the body
+# budget only needs to carry the top-scored files' code for discovery context,
+# NOT every file in full. The critic gets verification DEPTH separately, from
+# finding_critic.finding_aware_code_blob (full content of CITED files). So this
+# budget is deliberately set BELOW the old worst case (8 files × 3500 = 28000)
+# to actually reduce tokens, not grow them. With the symbol map (~3-5k chars)
+# carrying breadth, a 14k body budget keeps the TOTAL blob at/below the old
+# ~17k worst case — a net token reduction WITH the blindness fix, not a trade.
+# Env-tunable for big monorepos.
+_CONTEXT_BUDGET_CHARS = int(os.getenv("SHIPMATE_CONTEXT_BUDGET_CHARS", "14000"))
+
+# Chars reserved for the elision marker inside a head+tail slice, so the sliced
+# result never exceeds the caller's budget.
+_ELISION_MARKER_CHARS = 50
+
+
+def _head_tail(content: str, budget: int) -> str:
+    """Slice a too-large file to AT MOST `budget` chars (marker included),
+    keeping BOTH ends — the head (imports, top-level wiring) and the tail
+    (late-defined gates/guards a head-only cut would hide). ~60% head / 40%
+    tail. For a budget too small to slice meaningfully, return a plain head cut."""
+    if len(content) <= budget:
+        return content
+    if budget <= _ELISION_MARKER_CHARS + 20:
+        return content[:max(budget, 0)]
+    body_budget = budget - _ELISION_MARKER_CHARS
+    head = int(body_budget * 0.6)
+    tail = body_budget - head
+    omitted = len(content) - body_budget
+    marker = f"\n\n# … [{omitted} chars elided — middle of file] …\n\n"
+    return content[:head] + marker + (content[-tail:] if tail > 0 else "")
+
 
 def _repo_code_blob(
     context: Dict[str, Any],
     max_files: int = 5,
-    max_chars_per_file: int = 3500,
+    max_chars_per_file: int = 3500,  # retained for back-compat; superseded by budget
     prefer: tuple = (),
+    budget_chars: Optional[int] = None,
 ) -> str:
     """
-    Build a compact text blob containing the file tree + the top-N most
-    relevant file contents for the LLM to reason about.
+    Build a compact, MAP-FIRST text blob: a symbol skeleton of every parseable
+    file (so no symbol is ever fully invisible), the file tree, then the bodies
+    of the top-scored files filled to a token-aware budget (no blind per-file
+    tail truncation).
 
     `prefer`: substrings that boost a file's relevance score. e.g. ("auth",
     "cors") for the GuardRail discovery pass. RepoLens entry_points are
-    always given top priority.
+    always given top priority. `budget_chars` overrides the global default for
+    the total BODY budget (the symbol map + tree are cheap and not counted).
     """
     file_tree: List[str] = context.get("file_tree") or []
     key_files: Dict[str, str] = context.get("key_files") or {}
     repo_lens = context.get("repo_lens")
     entry_points = list(repo_lens.entry_points) if repo_lens else []
+    budget = budget_chars if budget_chars is not None else _CONTEXT_BUDGET_CHARS
 
     # Score every key_file path by how relevant it looks.
     def _score(path: str) -> int:
@@ -806,25 +1001,79 @@ def _repo_code_blob(
         candidates = [(p, c) for p, c in key_files.items() if c]
 
     candidates.sort(key=lambda pc: _score(pc[0]), reverse=True)
-    selected = candidates[:max_files]
 
     lines: List[str] = []
+
+    # ── MAP FIRST — a symbol skeleton of EVERY parseable file we have. This is
+    # the "find, don't chug" half: even a file whose body doesn't fit the budget
+    # still has its importable symbols visible here, so the model can NAME it as
+    # relevant instead of being blind to it. Reuses the same ast-export
+    # extraction the Coder repo-map and the import lint use.
+    try:
+        from app.services.repo_map import _render_symbols
+        symbol_map = _render_symbols(
+            {p: c for p, c in candidates}, [p for p, _ in candidates],
+        )
+    except Exception:  # pragma: no cover - fail-open to no map
+        symbol_map = ""
+    if symbol_map:
+        lines.append("## Symbol map — modules and their exported symbols")
+        lines.append(symbol_map)
+        lines.append("")
+
     if file_tree:
         # Top of the tree — first 60 paths is plenty of structural context.
         lines.append("## File tree (first 60 entries)")
         lines.extend(f"- {p}" for p in file_tree[:60])
         lines.append("")
 
-    if selected:
-        lines.append(f"## Top {len(selected)} files (truncated to {max_chars_per_file} chars each)")
-        for path, content in selected:
-            snippet = content[:max_chars_per_file]
+    # ── BODIES — fill to a token-aware budget, scored order. A file shown is
+    # shown WHOLE (no tail hidden); the single file that overflows the remaining
+    # budget is head+tail-sliced; everything past the budget becomes a name-only
+    # list so the model knows the file exists (and its symbols are in the map).
+    # Note: discovery breadth comes from the symbol map; verification DEPTH for a
+    # specific finding comes from the critic's finding_aware_code_blob (full
+    # cited files), so a body that lands in the name list is not "blind" — its
+    # symbols are mapped and the critic re-fetches it in full if it's cited.
+    shown: List[tuple] = []
+    overflow: List[str] = []
+    spent = 0
+    for idx, (path, content) in enumerate(candidates):
+        remaining = budget - spent
+        if len(shown) >= max_files or remaining <= 0:
+            overflow.append(path)
+            continue
+        if len(content) <= remaining:
+            shown.append((path, content))
+            spent += len(content)
+        else:
+            # Doesn't fully fit — give it the rest of the budget head+tail-sliced
+            # (keeps BOTH ends, so a deep tail gate stays visible), then stop
+            # adding bodies. Use the loop index (not list.index, which would
+            # ValueError on duplicate content) to push the rest to the name list.
+            shown.append((path, _head_tail(content, remaining)))
+            spent = budget
+            overflow.extend(p for p, _ in candidates[idx + 1:])
+            break
+
+    if shown:
+        lines.append(f"## Top {len(shown)} files (full content; budget-filled)")
+        for path, content in shown:
             lines.append(f"\n### `{path}`")
             lines.append("```")
-            lines.append(snippet)
-            if len(content) > max_chars_per_file:
-                lines.append(f"... [truncated; {len(content) - max_chars_per_file} more chars]")
+            lines.append(content)
             lines.append("```")
+
+    if overflow:
+        # De-dup while preserving order; cap the list so a huge repo can't bloat.
+        seen: set = set()
+        uniq = [p for p in overflow if not (p in seen or seen.add(p))]
+        lines.append("")
+        lines.append(
+            f"## Other files present (not shown in full — see symbol map above): "
+            + ", ".join(f"`{p}`" for p in uniq[:40])
+            + (f" (+{len(uniq) - 40} more)" if len(uniq) > 40 else "")
+        )
 
     return "\n".join(lines) if lines else "(no repo content available)"
 
@@ -974,6 +1223,80 @@ _DISCOVERY_OPPORTUNITY_SYSTEM = (
     "  - anything you cannot tie to a file in `evidence`.\n\n"
     "Bias HARD toward grounding, NOVELTY, and value. Five sharply-grounded, "
     "not-already-done opportunities beat ten obvious ones."
+)
+
+
+_DISCOVERY_INNOVATION_SYSTEM = (
+    "You are a principal engineer + applied researcher running a BLUE-SKY "
+    "innovation review of a repo. Unlike a conservative code review, your job "
+    "is to propose AMBITIOUS, novel, high-ceiling ideas that would meaningfully "
+    "advance what this product can do — the kind of idea a roadmap review would "
+    "get excited about, not a lint fix.\n\n"
+    "Lean into these shapes (mix them):\n"
+    "  • feature      — a genuinely new CAPABILITY the product doesn't have: a "
+    "new agent/analysis pass, a new modality, an integration, a feedback loop, "
+    "a learning/eval mechanism, an autonomy upgrade.\n"
+    "  • improvement  — a step-change to an existing capability (not a tweak): "
+    "replace a heuristic with a learned signal, add a closed loop where it's "
+    "open, make a single-shot pass iterative, add cross-run memory.\n"
+    "  • research     — a direction worth prototyping even if the payoff is "
+    "uncertain: a smarter retrieval/ranking strategy, an adversarial/verify "
+    "stage, an A/B-able harness change. Mark these category='improvement' (the "
+    "schema has no 'research' value) but be explicit in the description that "
+    "it's exploratory.\n\n"
+    "Crucial difference from a normal review: speculative, architectural, and "
+    "future-facing ideas are WELCOME here — that's the point. But ambition is "
+    "NOT an excuse for hand-waving. Every idea MUST still:\n"
+    "  1. Cite REAL files in `evidence` — anchor the idea to code that exists "
+    "(the system it extends, the seam it plugs into). An idea with no anchor is "
+    "a daydream; do not emit it.\n"
+    "  2. Name plausible `target_files` (existing files it would touch or sit "
+    "beside) — new files are fine, but say which existing module they extend.\n"
+    "  3. Explain in `rationale` WHY it's high-value AND why it's feasible to "
+    "PROTOTYPE in <=21 days (a first cut, not the full vision).\n"
+    "  4. Be NEW — do not propose anything in the ALREADY-EXISTS lists.\n\n"
+    "GOOD innovation examples (SHAPE only — judge against THIS repo):\n"
+    "  [feature]     'add a <new>_agent pass that does X, slotting into the "
+    "orchestrator beside the existing agents in <file>.'\n"
+    "  [improvement] 'the <pass> in <file> is single-shot + heuristic; add a "
+    "verify→refine loop that re-scores its own output before emitting.'\n"
+    "  [improvement] '(exploratory) replace the keyword scoring in <file> with "
+    "a lightweight reference-graph signal to rank files by structural centrality.'\n\n"
+    "BAD (DO NOT EMIT): generic 'add tests/CI/docs'; vague 'use AI/ML' with no "
+    "seam named; anything in the ALREADY-EXISTS lists; ideas with no file anchor.\n\n"
+    "Bias toward AMBITION + a real anchor. Four bold, anchored, not-already-done "
+    "ideas beat ten safe ones."
+)
+
+
+_RESEARCH_SYSTEM = (
+    "You are a staff engineer doing a DEEP CODEBASE RESEARCH pass. You are given "
+    "the repo summary, the most important file bodies, and a REFERENCE-GRAPH "
+    "SUMMARY computed from the real import/symbol edges (god modules by fan-in, "
+    "import cycles, orphan modules, and unreferenced exports).\n\n"
+    "Your job: answer the user's question (if one is asked) AND surface concrete "
+    "findings — loops/holes/tweaks and messy DATAFLOW — that a maintainer should "
+    "act on. Findings kinds:\n"
+    "  • dataflow    — tangled/duplicated data paths, signature drift, a value "
+    "threaded through many layers, redundant transforms.\n"
+    "  • dead_code   — an unreferenced export / orphan module the graph flags "
+    "(confirm it's truly unused, not an entry point or dynamically used).\n"
+    "  • coupling    — a god-module the graph shows high fan-in to, or an import "
+    "cycle; explain the concrete risk it creates.\n"
+    "  • risk        — a latent bug / missing error path / unsafe assumption in "
+    "an actual code path.\n"
+    "  • observation — a noteworthy fact that isn't yet actionable.\n\n"
+    "GROUNDING RULES (non-negotiable):\n"
+    "  1. Every finding MUST cite REAL file paths in `evidence`.\n"
+    "  2. When a finding is backed by the graph summary, put the exact signal in "
+    "`graph_signal` (e.g. 'fan_in=11', 'cycle: a.py<->b.py', 'unreferenced "
+    "export: parse_foo'). Prefer graph-supported findings — they're verifiable.\n"
+    "  3. Do NOT invent edges the graph/code doesn't show. If the graph says a "
+    "module is a god-module, trust it over a guess.\n"
+    "  4. A dead_code finding the graph did NOT flag is suspect — say why you "
+    "still believe it (e.g. 'defined but only referenced in a comment').\n\n"
+    "Be specific and honest. A few sharp, graph-grounded findings beat a long "
+    "list of vague ones."
 )
 
 
@@ -1229,6 +1552,66 @@ def _user_prompt_opportunity_discovery(
         "Prefer DEEPER, less-obvious improvements (specific functions, edge "
         "cases, perf hotspots, missing error handling) over broad scaffolding. "
         "Return ONLY the OpportunityDiscovery schema."
+    )
+
+
+def _user_prompt_innovation_discovery(
+    context: Dict[str, Any], code_blob: str, max_opportunities: int,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
+) -> str:
+    exclude_titles = exclude_titles or []
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY PROPOSED / SHIPPED / DISMISSED — DO NOT propose any of "
+            "these again, or anything that overlaps them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    return (
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Propose up to {max_opportunities} AMBITIOUS, novel innovation ideas "
+        "for THIS repo — new capabilities, step-change improvements, and "
+        "exploratory research directions worth prototyping. HARD RULES:\n"
+        "  • Do NOT propose anything in the ALREADY-EXISTS lists above, or "
+        "overlapping the DO-NOT-PROPOSE list.\n"
+        "  • Every idea MUST anchor to a REAL file in `evidence` (the system it "
+        "extends / the seam it plugs into) — ambition is welcome, hand-waving "
+        "is not.\n"
+        "  • Say which existing module each idea extends in `target_files` "
+        "(new files are fine alongside them).\n"
+        "  • `rationale` must argue both VALUE and why a first cut is feasible "
+        "in <=21 days.\n"
+        "Favour bold, high-ceiling ideas over safe ones — but every one must be "
+        "anchored in this repo's actual code. Return ONLY the OpportunityDiscovery "
+        "schema."
+    )
+
+
+def _user_prompt_research(
+    context: Dict[str, Any], code_blob: str, graph_summary: Dict[str, Any],
+    *, question: str = "", max_findings: int = 8,
+) -> str:
+    graph_json = json.dumps(graph_summary or {}, default=list)[:8000]
+    q_block = (
+        f"# Question to answer\n{question.strip()}\n\n"
+        if (question or "").strip()
+        else "# No specific question — do an open dataflow/cleanup audit.\n\n"
+    )
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"{q_block}"
+        f"# Reference-graph summary (computed from REAL import/symbol edges)\n"
+        f"{graph_json}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Answer the question (if any) and surface up to {max_findings} grounded "
+        "findings (loops/holes/tweaks/dataflow). HARD RULES: every finding cites "
+        "real files in `evidence`; when backed by the graph summary, put the exact "
+        "signal in `graph_signal`; prefer graph-supported findings; do NOT invent "
+        "edges. Return ONLY the _ResearchDiscovery schema."
     )
 
 

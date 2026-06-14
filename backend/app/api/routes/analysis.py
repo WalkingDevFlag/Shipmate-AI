@@ -20,13 +20,6 @@ router = APIRouter(tags=["analysis"])
 # instances) so concurrent runs can never share mutable agent state. Agent
 # construction is cheap (no I/O in __init__), so this costs ~nothing.
 
-async def _verify_repo_write_access(token: str, owner: str, repo: str) -> None:
-    """Back-compat shim — the canonical check now lives in app.api.deps.
-    Kept (with this token-first signature) because build.py imports it from
-    here and the call sites below pass token= by keyword."""
-    await verify_repo_write_access(owner, repo, token)
-
-
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest):
     """
@@ -50,11 +43,7 @@ async def analyze(request: AnalyzeRequest):
     request.access_token = require_body_credential(request.access_token)
 
     # --- Authorization check: token must have write access to the target repo ---
-    await _verify_repo_write_access(
-        token=request.access_token,
-        owner=request.owner,
-        repo=request.repo,
-    )
+    await verify_repo_write_access(request.owner, request.repo, request.access_token)
 
     try:
         # Single front door — build_context + enrich + RepoLens, cached per
@@ -109,9 +98,7 @@ async def analyze_stream(request: AnalyzeRequest):
 
     request.access_token = require_body_credential(request.access_token)
 
-    await _verify_repo_write_access(
-        token=request.access_token, owner=request.owner, repo=request.repo,
-    )
+    await verify_repo_write_access(request.owner, request.repo, request.access_token)
 
     try:
         index = await RepoIndexService.get_or_build(

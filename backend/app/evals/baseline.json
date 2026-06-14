@@ -1,0 +1,28 @@
+{
+  "name": "shipmate-baseline",
+  "description": "Baseline EvalOps spec: the app boots and its core read endpoints answer with the expected shape. Run by the CI eval-gate against the live app; CIWatcher consumes the eval-report.json artifact like JUnit XML.",
+  "scenarios": [
+    {
+      "name": "health-live",
+      "method": "GET",
+      "url": "/health",
+      "expect_status": 200,
+      "assertions": [
+        { "path": "status", "equals": "healthy" },
+        { "path": "agents", "gte": 4 }
+      ]
+    },
+    {
+      "name": "root-identity",
+      "method": "GET",
+      "url": "/",
+      "expect_status": 200,
+      "assertions": [
+        { "path": "service", "contains": "ShipMate" },
+        { "path": "agents", "exists": true }
+      ]
+    }
+  ],
+  "metrics": [],
+  "logs": { "forbid_patterns": ["Traceback", "CRITICAL"] }
+}

@@ -11,6 +11,7 @@ from app.api.deps import resolve_access_token
 logger = logging.getLogger("shipmate.auth_route")
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
+logger = logging.getLogger("shipmate.auth")
 
 
 @router.get("/login")
@@ -25,7 +26,7 @@ async def github_login():
 
 
 @router.get("/callback")
-async def github_callback(code: str = Query(...), state: str = Query(...)):
+async def github_callback(code: str, state: str):
     """Exchange OAuth code for access token and return user profile."""
     try:
         token_data = await GitHubAuthService.exchange_code_for_token(code, state)
@@ -77,7 +78,6 @@ async def get_repos(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's repositories."""
     try:
         repos = await GitHubAPIService.get_user_repos(access_token)
-        # Return only the fields the frontend needs
         result = []
         for r in repos:
             result.append({
@@ -98,6 +98,8 @@ async def get_repos(access_token: str = Depends(resolve_access_token)):
                 },
             })
         return {"repos": result, "count": len(result)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -116,6 +118,8 @@ async def get_branches(owner: str, repo_name: str, access_token: str = Depends(r
             for b in branches
         ]
         return {"branches": formatted, "count": len(formatted)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -137,6 +141,8 @@ async def get_pulls(owner: str, repo_name: str, access_token: str = Depends(reso
             for p in pulls
         ]
         return {"pulls": formatted, "count": len(formatted)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -152,3 +158,4 @@ async def logout(access_token: str = Depends(resolve_access_token)):
         return {"success": True, "message": "Logged out"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True, "message": "Logged out"}

@@ -97,6 +97,8 @@ def synthesize_and_verify(
     cov_package: str = "app",
     require_coverage_gain: bool = True,
     self_repo_only: bool = True,
+    eval_spec: Optional[Any] = None,
+    eval_fn: Optional[Callable[[Any, List[Dict[str, str]]], Any]] = None,
 ) -> SynthesisResult:
     """Synthesize a test from `test` via `coder_fn`, then VERIFY it is a genuine
     artifact (collectable + passing + coverage-adding) using ValidationGate.
@@ -107,6 +109,14 @@ def synthesize_and_verify(
     `require_coverage_gain`: when True, a test that passes but doesn't measurably
     raise coverage or the passing-test count is REJECTED (no-value artifact).
     Set False to accept any green, collectable test.
+
+    EvalOps generalization (Phase 5): when `eval_spec` (a ValidationSpec) and
+    `eval_fn` ((spec, files) -> EvalReport) are supplied, the coverage signal is
+    AUGMENTED with the eval signal — the artifact must ALSO make the spec's
+    scenarios pass / metrics fire / logs stay clean. This is the same accept/
+    reject shape with a pluggable signal: 'did the artifact move a measurable
+    signal in the right direction?' generalized from coverage-delta to a
+    declarative spec. When neither is supplied, behaviour is exactly as before.
 
     Returns a SynthesisResult; the working tree is always restored (we never
     leave the synthesized file on disk — a PR is opened separately via the
@@ -162,6 +172,33 @@ def synthesize_and_verify(
                     f"(Δ{delta.coverage_delta:+}%) — likely retests covered code",
                     test_path=test_path, files=files, coverage_delta=delta.as_dict(),
                 )
+        # 2d. EvalOps signal (Phase 5, opt-in): the artifact must ALSO satisfy
+        #     the declarative spec — scenarios pass, metrics fire, logs clean.
+        #     Augments the coverage signal; a passing-but-spec-failing artifact
+        #     is rejected with the eval failures so the loop learns.
+        if eval_spec is not None and eval_fn is not None:
+            try:
+                report = eval_fn(eval_spec, files)
+            except Exception as e:
+                report = None
+                logger.info("eval_fn raised (%s) — treating eval as no-signal", e)
+            # Intentional asymmetry (review F7): a BOOT/infra failure
+            # (report.ran False) is treated as NO SIGNAL here — it must not flip
+            # a coverage-accepted test to rejected, because the eval infra
+            # failing says nothing about the artifact. (The CI eval-gate, by
+            # contrast, DOES red on a boot failure — there a broken boot IS the
+            # signal.) Only a spec that actually RAN and FAILED rejects.
+            if report is not None and report.ran and not report.passed:
+                fails = [f for s in report.scenarios for f in s.failures]
+                fails += [f"metric {m.name} expectation unmet" for m in report.metrics if not m.satisfied]
+                fails += report.log_violations
+                return SynthesisResult(
+                    test.name, False,
+                    f"test passes + adds coverage but the EvalOps spec FAILED: "
+                    f"{'; '.join(fails[:4]) or 'see eval report'}",
+                    test_path=test_path, files=files, coverage_delta=delta.as_dict(),
+                )
+
         return SynthesisResult(
             test.name, True,
             f"verified: +{delta.tests_delta} passing test(s), "

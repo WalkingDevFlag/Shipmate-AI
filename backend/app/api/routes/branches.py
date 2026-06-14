@@ -2,9 +2,7 @@
 GET  /api/branches/{owner}/{repo}/prune?dry_run=true   — preview deletions
 POST /api/branches/{owner}/{repo}/prune                — actually delete
 
-Both require an `access_token` query param (same pattern as the rest of
-the auth-bearing routes). Returns a per-branch decision log so the UI
-can render a "5 deleted, 3 kept" summary with reasons.
+Token is supplied via Authorization: Bearer <token> header.
 """
 
 from __future__ import annotations
