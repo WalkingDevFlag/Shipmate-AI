@@ -6,6 +6,7 @@ import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
 import { RadarBg } from '../components/ui/RadarBg';
 import { ActuateButton } from '../components/ui/ActuateButton';
 import { AGENTS } from '../lib/agents';
+import { downloadReportPdf, shareReport } from '../lib/reportExport';
 import type { ShipMateReport, SecurityFinding, RepoLensSummary } from '../types';
 
 /* ---------- Actuate context helpers ---------- */
@@ -80,6 +81,38 @@ function RationaleNote({ rationale }: { rationale?: string | null }) {
 function ExecutiveReportHeader({ report, onReRun }: { report: ShipMateReport; onReRun: () => void }) {
   const verdict = toVerdict(report.ship_recommendation);
   const topBlocker = report.key_blockers[0] ?? 'No critical blockers detected.';
+  const [downloading, setDownloading] = useState(false);
+  const [shareLabel, setShareLabel] = useState<'Share' | 'Sharing…' | 'Copied!' | 'Shared'>('Share');
+  const [shareErr, setShareErr] = useState<string | null>(null);
+
+  const handleDownload = async () => {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      await downloadReportPdf(report);
+    } catch (e) {
+      setShareErr((e as Error).message || 'Could not open the print dialog.');
+      window.setTimeout(() => setShareErr(null), 4000);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleShare = async () => {
+    setShareErr(null);
+    setShareLabel('Sharing…');
+    try {
+      const res = await shareReport(report);
+      setShareLabel(res === 'copied' ? 'Copied!' : res === 'shared' ? 'Shared' : 'Share');
+    } catch (e) {
+      setShareLabel('Share');
+      setShareErr((e as Error).message || 'Sharing is not supported here.');
+      window.setTimeout(() => setShareErr(null), 4000);
+      return;
+    }
+    window.setTimeout(() => setShareLabel('Share'), 2200);
+  };
+
   return (
     <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden' }}>
       <RadarBg sweep rings blobs={false} style={{ opacity: 0.3 }} />
@@ -105,9 +138,16 @@ function ExecutiveReportHeader({ report, onReRun }: { report: ShipMateReport; on
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignSelf: 'flex-start' }}>
-          <button className="btn btn-secondary btn-sm"><Download size={14} /> Download PDF</button>
-          <button className="btn btn-secondary btn-sm"><Share2 size={14} /> Share</button>
+          <button className="btn btn-secondary btn-sm" onClick={handleDownload} disabled={downloading} aria-busy={downloading}>
+            <Download size={14} /> {downloading ? 'Preparing…' : 'Download PDF'}
+          </button>
+          <button className="btn btn-secondary btn-sm" onClick={handleShare} aria-live="polite">
+            {shareLabel === 'Copied!' || shareLabel === 'Shared' ? <Check size={14} /> : <Share2 size={14} />} {shareLabel}
+          </button>
           <button className="btn btn-primary btn-sm" onClick={onReRun}><RotateCcw size={14} /> Re-run</button>
+          {shareErr && (
+            <span className="mono" style={{ fontSize: 10.5, color: '#fca5a5', maxWidth: 150, lineHeight: 1.4 }}>{shareErr}</span>
+          )}
         </div>
       </div>
     </div>

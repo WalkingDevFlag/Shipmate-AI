@@ -182,6 +182,20 @@ export interface AgentOutputs {
   testpilot: TestPilotOutput;
 }
 
+/** Optional PR-scoped risk summary. Populated only when the backend runs a
+ *  PR-Risk pass (absent on this build), so it's always optional here — the PDF
+ *  export reads it defensively and omits the section when undefined. */
+export interface PRRiskOutput {
+  pr_number: number;
+  title: string;
+  risk_level: string;   // "critical" | "high" | "medium" | "low"
+  risk_score: number;
+  summary: string;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+}
+
 export interface ShipMateReport {
   repo: RepoInfo;
   readiness_score: number;
@@ -195,6 +209,8 @@ export interface ShipMateReport {
    *  unavailable) — the UI shows a heuristic-only banner. Optional for
    *  back-compat with older payloads. */
   ai_enhanced?: boolean;
+  /** Present only for a PR-scoped analysis; used by the PDF export. */
+  pr_risk?: PRRiskOutput | null;
 }
 
 export interface AnalyzeResponse {
